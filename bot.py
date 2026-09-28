@@ -31,7 +31,9 @@ from telethon import TelegramClient, events
 from telethon.errors import FloodWaitError, MessageNotModifiedError
 from telethon.sessions import StringSession
 from telethon.tl.functions.messages import CheckChatInviteRequest
-from telethon.tl.types import (ChatInviteAlready, UserStatusOnline,
+from telethon.tl.functions.account import SetPrivacyRequest
+from telethon.tl.types import (ChatInviteAlready, InputPrivacyKeyStatusTimestamp,
+                               InputPrivacyValueAllowAll, UserStatusOnline,
                                UserStatusOffline, UserStatusRecently,
                                UserStatusLastWeek, UserStatusLastMonth)
 
@@ -76,6 +78,11 @@ NTFY_SERVER = os.environ.get("NTFY_SERVER", "https://ntfy.sh").rstrip("/")
 NTFY_LEVEL = os.environ.get("NTFY_LEVEL", "alerts")  # alerts|everything
 
 LOG_MESSAGE_TEXT = os.environ.get("LOG_MESSAGE_TEXT", "1") == "1"
+
+# keep OUR last-seen privacy at 'Everybody' so Telegram's reciprocity rule
+# doesn't hide everyone else's exact last-seen from the bot (the moderator
+# accepts being visible in exchange). Set PRIVACY_AUTO=0 to opt out.
+PRIVACY_AUTO = os.environ.get("PRIVACY_AUTO", "1") == "1"
 
 # per-user board messages (online/offline history, one edited msg per member)
 BOARD_EVERY = int(os.environ.get("BOARD_EVERY", "5"))       # flush cycle, seconds
@@ -1132,6 +1139,25 @@ async def chain_next_run():
     await client.disconnect()
 
 
+async def ensure_last_seen_visibility():
+    """Telegram hides other people's last-seen from accounts that hide
+    their own (reciprocity). Keep OUR last-seen set to 'Everybody' so the
+    bot can see everyone's exact online/offline times. Re-applied on every
+    start (each handover), so a manual change on the phone self-heals
+    within one run. Members who hard-hide their own last-seen still fall
+    back to 'recently / last week / last month' (record_status)."""
+    if not PRIVACY_AUTO:
+        return
+    try:
+        await client(SetPrivacyRequest(
+            key=InputPrivacyKeyStatusTimestamp(),
+            rules=[InputPrivacyValueAllowAll()]))
+        log.info("account last-seen privacy set to 'Everybody' (reciprocity)")
+    except Exception:
+        log.exception("could not set last-seen privacy - exact last-seen "
+                      "of others may stay hidden")
+
+
 async def main():
     global notifier, SELF_ID, boards
 
@@ -1142,6 +1168,7 @@ async def main():
     me = await client.get_me()
     SELF_ID = me.id
     log.info("logged in as %s", me.first_name)
+    await ensure_last_seen_visibility()
 
     log_entity = await resolve_log_group()
     cleanup_bad_rows()
