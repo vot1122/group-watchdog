@@ -100,45 +100,39 @@ def score(m, msg=None, churn=0):
     # --- spam signals (message behaviour) ---
     if msg.get("peak") and msg["peak"] > 100:
         s += 20
-        reasons.append("message flood: %d messages in a single hour" % msg["peak"])
+        reasons.append("flood: %d msgs/hour" % msg["peak"])
     if msg.get("deleted", 0) >= 5 and msg.get("sent") and \
             msg["deleted"] / msg["sent"] >= 0.3:
         s += 10
-        reasons.append("deleted %d of their own %d messages" % (
-            msg["deleted"], msg["sent"]))
+        reasons.append("deleted %d/%d own msgs" % (msg["deleted"], msg["sent"]))
     if churn >= 3:
         s += 10
-        reasons.append("joined/left the group %d times (churn)" % churn)
+        reasons.append("join/leave churn x%d" % churn)
 
     # --- spam signals (presence behaviour) ---
     if m["window_h"] < 6:
         if not reasons:
-            reasons.append("not enough data yet - keep the monitor running "
-                           "for at least a day")
+            reasons.append("not enough data yet (needs ~a day)")
         return min(s, 100), reasons
 
     if m["uptime_ratio"] is not None and m["uptime_ratio"] >= 0.98 and m["window_h"] >= 24:
         s += 40
-        reasons.append("online ~24/7 across a full day+ (real humans sleep; "
-                       "userbots and automation scripts stay connected)")
+        reasons.append("online 24/7")
     if m["gap_cv"] is not None and m["gap_cv"] < 0.15 and len(m["gaps"]) >= 10:
         s += 25
-        reasons.append("offline gaps are machine-regular "
-                       "(coefficient of variation %.2f)" % m["gap_cv"])
+        reasons.append("machine-regular offline gaps")
     if m["active_h"] >= 20 and m["online_events"] >= 50:
         s += 20
-        reasons.append("comes online in %d of the 24 hours of the day "
-                       "- no sleep pattern" % m["active_h"])
+        reasons.append("online in %d/24 hours, no sleep pattern" % m["active_h"])
     if m["longest_gap"] is not None and m["longest_gap"] < 3600 and m["window_h"] >= 48:
         s += 15
-        reasons.append("never offline for a full hour across 2+ days")
+        reasons.append("never offline a full hour (2+ days)")
     if m["avg_session"] is not None and m["avg_session"] < 10 and m["n_sessions"] >= 20:
         s += 10
-        reasons.append("many very short sessions (avg %s) - typical of scripted "
-                       "pings" % human(m["avg_session"]))
+        reasons.append("micro-sessions, avg %s" % human(m["avg_session"]))
 
     if not reasons:
-        reasons.append("no automation signals found - presence pattern looks human")
+        reasons.append("no automation signals - looks human")
     return min(s, 100), reasons
 
 
@@ -387,8 +381,15 @@ def build_report(db):
     return "\n".join(lines), results
 
 
-def compact_report(db, limit=8):
-    """Short live summary shown in the log group's LIVE REPORT message."""
+def _knum(n):
+    if n >= 1000:
+        s = "%.1fk" % (n / 1000)
+        return s.rstrip("0").rstrip(".")
+    return str(n)
+
+
+def compact_report(db, limit=6):
+    """Brief live dashboard shown in the log group's LIVE REPORT message."""
     users = {r[0]: {"username": r[1], "display_name": r[2]}
              for r in db.execute(
                  "SELECT user_id, username, display_name, is_bot FROM users")}
@@ -412,19 +413,28 @@ def compact_report(db, limit=8):
         u = users.get(uid, {})
         return u.get("username") or uid
 
-    lines = ["LIVE REPORT - updated %s UTC" %
-             datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M"), ""]
+    now = datetime.now(timezone.utc)
+    first = min((rows[0][0] for rows in events.values()), default=None)
+    watching = ""
+    if first:
+        d = now.timestamp() - first
+        watching = " · watching %dd%02dh" % (d // 86400, (d % 86400) // 3600)
+
+    lines = ["\U0001F4CA LIVE REPORT · %s UTC%s" % (
+        now.strftime("%d %b %H:%M"), watching)]
 
     shown = [m for m in results if m["score"] > 0][:limit]
     if shown:
-        lines.append("Top suspects:")
-        for i, m in enumerate(shown, 1):
-            lines.append("%d. %s - %d/100 %s - %s" % (
-                i, uname(m["user_id"]), m["score"], label(m["score"]),
-                (m["reasons"][0] if m["reasons"] else "")[:70]))
+        lines.append("─ suspects ─")
+        for m in shown:
+            mark = ("\U0001F534" if m["score"] >= 70
+                    else "\U0001F7E1" if m["score"] >= 40 else "\u25CB")
+            lines.append("%s %d %s · %s" % (
+                mark, m["score"], uname(m["user_id"]),
+                "; ".join(m["reasons"][:2])[:70]))
     else:
-        lines.append("No automation signals yet (needs ~a day of data).")
-    lines.append("")
+        lines.append("no suspects yet · needs ~a day of data")
+
     try:
         n_msgs = db.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
         n_del = db.execute(
@@ -432,14 +442,14 @@ def compact_report(db, limit=8):
     except sqlite3.OperationalError:
         n_msgs = n_del = 0
     n_ev = sum(len(v) for v in events.values())
-    lines.append("members: %d | presence events: %d | messages: %d (%d deleted)"
-                 % (len(users), n_ev, n_msgs, n_del))
+    lines.append("─ stats ─")
+    lines.append("%d members · %s events · %s msgs (%s del)" % (
+        len(users), _knum(n_ev), _knum(n_msgs), _knum(n_del)))
     talkers = sorted(((m["msg"]["sent"], m) for m in results if m["msg"]),
                       key=lambda x: -x[0])[:5]
     if talkers:
-        lines.append("")
-        lines.append("Top talkers: " + ", ".join(
-            "%s (%d)" % (uname(m["user_id"]), sent) for sent, m in talkers))
+        lines.append("talkers: " + " · ".join(
+            "%s %s" % (uname(m["user_id"]), sent) for sent, m in talkers))
     return "\n".join(lines)[:3800]
 
 

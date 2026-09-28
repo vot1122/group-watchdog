@@ -27,7 +27,7 @@ from collections import deque
 from datetime import datetime, timezone
 
 from telethon import TelegramClient, events
-from telethon.errors import FloodWaitError
+from telethon.errors import FloodWaitError, MessageNotModifiedError
 from telethon.sessions import StringSession
 from telethon.tl.functions.messages import CheckChatInviteRequest
 from telethon.tl.types import ChatInviteAlready, UserStatusOnline, UserStatusOffline
@@ -73,6 +73,10 @@ NTFY_SERVER = os.environ.get("NTFY_SERVER", "https://ntfy.sh").rstrip("/")
 NTFY_LEVEL = os.environ.get("NTFY_LEVEL", "alerts")  # alerts|everything
 
 LOG_MESSAGE_TEXT = os.environ.get("LOG_MESSAGE_TEXT", "1") == "1"
+
+# per-user board messages (online/offline history, one edited msg per member)
+BOARD_EVERY = int(os.environ.get("BOARD_EVERY", "5"))       # flush cycle, seconds
+BOARD_HISTORY = int(os.environ.get("BOARD_HISTORY", "12"))    # sessions kept per board
 
 # --- alert thresholds ---------------------------------------------------
 FLOOD_MSGS = int(os.environ.get("FLOOD_MSGS", "20"))      # messages ...
@@ -137,15 +141,25 @@ CREATE TABLE IF NOT EXISTS settings (
 """
 
 db = sqlite3.connect(DB_PATH, check_same_thread=False)
+try:
+    db.execute("PRAGMA journal_mode=WAL")      # fast + safe concurrent reads
+    db.execute("PRAGMA synchronous=NORMAL")
+except sqlite3.OperationalError:
+    pass
 db.executescript(SCHEMA)
 db.commit()
 
 SELF_ID = None
 NAMES = {}  # uid -> readable name
+LAST_STATE = {}  # uid -> (ts, online) of last accepted event (dedup guard)
 
 
 def now_str():
     return datetime.now(timezone.utc).strftime("%H:%M:%S")
+
+
+def now_min():
+    return datetime.now(timezone.utc).strftime("%H:%M")
 
 
 def name_of(uid):
@@ -171,12 +185,30 @@ def group_event(kind, data="", user_id=None):
 
 
 def record_presence(user_id, online, ts, source="update"):
+    """Insert a presence transition unless it is a duplicate or stale.
+    Returns True if a row was actually inserted."""
     if user_id == SELF_ID:      # don't track ourselves (we look online 24/7)
-        return
+        return False
+    if user_id not in LAST_STATE:
+        row = db.execute(
+            "SELECT ts, online FROM presence_events WHERE user_id=? "
+            "ORDER BY ts DESC LIMIT 1", (user_id,)).fetchone()
+        LAST_STATE[user_id] = tuple(row) if row else None
+    last = LAST_STATE.get(user_id)
+    if last is not None:
+        lts, lon = last
+        if lon == online:            # same state again: no new information
+            if ts > lts:             # but remember the fresher timestamp
+                LAST_STATE[user_id] = (ts, online)
+            return False
+        if ts <= lts - 2:            # stale / out-of-order event
+            return False
     db.execute(
         "INSERT INTO presence_events (user_id, online, ts, source) VALUES (?,?,?,?)",
         (user_id, online, ts, source))
+    LAST_STATE[user_id] = (ts, online)
     db.commit()
+    return True
 
 
 def cleanup_bad_rows():
@@ -203,12 +235,12 @@ def upsert_user(u, detect_changes=True):
             data = "%s -> %s" % (old[0] or "(none)", u.username or "(none)")
             group_event("username_change", data, u.id)
             if notifier:
-                notifier.tg("[%s] %s changed username: %s" % (now_str(), name_of(u.id), data), 1)
+                notifier.tg("%s | %s username: %s" % (now_min(), name_of(u.id), data), 1)
         if (old[1] or "") != (name or ""):
             data = "%s -> %s" % (old[1] or "(none)", name or "(none)")
             group_event("name_change", data, u.id)
             if notifier:
-                notifier.tg("[%s] %s changed name: %s" % (now_str(), name_of(u.id), data), 1)
+                notifier.tg("%s | %s name: %s" % (now_min(), name_of(u.id), data), 1)
     db.execute(
         """INSERT INTO users (user_id, username, display_name, is_bot, first_observed)
            VALUES (?,?,?,?,?)
@@ -250,8 +282,7 @@ def set_setting(key, value):
 
 
 START_TS = time.time()
-QUIET_SECONDS = int(os.environ.get("QUIET_SECONDS", "90"))  # ignore log-group forwarding of the startup status burst
-ONLINE_SINCE = {}
+QUIET_SECONDS = int(os.environ.get("QUIET_SECONDS", "90"))  # skip board/log forwarding of the startup status burst
 
 
 def short_dur(sec):
@@ -259,19 +290,8 @@ def short_dur(sec):
     if sec < 60:
         return "%ds" % sec
     if sec < 3600:
-        return "%dm" % sec
+        return "%dm" % (sec // 60)
     return "%dh%02dm" % (sec // 3600, (sec % 3600) // 60)
-
-
-def presence_line(uid, is_online):
-    if is_online:
-        ONLINE_SINCE[uid] = time.time()
-        return "%s | %s online" % (now_str(), name_of(uid))
-    started = ONLINE_SINCE.pop(uid, None)
-    if started:
-        return "%s | %s offline (%s)" % (
-            now_str(), name_of(uid), short_dur(time.time() - started))
-    return "%s | %s offline" % (now_str(), name_of(uid))
 
 
 def record_status(user_id, status, source):
@@ -279,9 +299,8 @@ def record_status(user_id, status, source):
         return
     fresh = time.time() - START_TS > QUIET_SECONDS
     if isinstance(status, UserStatusOnline):
-        record_presence(user_id, 1, time.time(), source)
-        if notifier and fresh:
-            notifier.presence(presence_line(user_id, True))
+        if record_presence(user_id, 1, time.time(), source) and fresh:
+            boards_touch(user_id)
     elif isinstance(status, UserStatusOffline):
         ts = time.time()
         if status.was_online:
@@ -292,9 +311,8 @@ def record_status(user_id, status, source):
             if ts < 1262304000:   # Telegram sends 1970 for hidden statuses
                 return              # - junk, do not record
             ts = min(ts, time.time())
-        record_presence(user_id, 0, ts, source)
-        if notifier and fresh:
-            notifier.presence(presence_line(user_id, False))
+        if record_presence(user_id, 0, ts, source) and fresh:
+            boards_touch(user_id)
     # UserStatusRecently / LastWeek / LastMonth: hidden by privacy, untrackable.
 
 
@@ -358,7 +376,7 @@ class Notifier:
             self.ntfy_buf.append(line)
 
     def presence(self, line):
-        self.tg(line, 2)
+        pass   # presence now goes to per-user boards (UserBoards below)
 
     async def alert(self, title, body):
         if self.tg_level >= 0:
@@ -427,7 +445,18 @@ class Notifier:
                 continue
             try:
                 import report as rep
-                text = rep.compact_report(db)
+
+                def build():
+                    # separate connection + worker thread: never blocks the
+                    # event loop that is busy capturing presence events
+                    conn = sqlite3.connect(DB_PATH)
+                    try:
+                        return rep.compact_report(conn)
+                    finally:
+                        conn.close()
+
+                text = await asyncio.get_event_loop().run_in_executor(
+                    None, build)
                 if self.report_msg_id:
                     await self.client.edit_message(
                         self.log_entity, self.report_msg_id, text,
@@ -460,7 +489,145 @@ class Notifier:
             client.loop.create_task(self._ntfy_loop())
 
 
+class UserBoards:
+    """One message per member, edited in place and fully REGENERATED from
+    the database on every change - so it self-heals across restarts and
+    6-hour handovers, and the uptime footer is always at the bottom:
+
+        @abc - online 17:30 (34m)
+
+        15:10→16:02 (52m)
+        14:02→14:37 (35m)
+
+        uptime 2h01m - 3 sessions - since 21 Sep
+
+    Edits are coalesced (one flush cycle per few seconds) and capped per
+    cycle to stay far below Telegram flood limits. Telegram refuses edits
+    after ~48h, so a stale board automatically rolls over into a fresh
+    message.
+    """
+
+    MAX_EDITS_PER_CYCLE = 15
+
+    def __init__(self, client, log_entity):
+        self.client = client
+        self.log_entity = log_entity
+        self.msg_ids = {}   # uid -> message id
+        self.dirty = set()
+
+    def enabled(self):
+        return (self.log_entity is not None
+                and notifier is not None and notifier.tg_level >= 2)
+
+    def touch(self, uid):
+        if self.enabled():
+            self.dirty.add(uid)
+
+    async def restore(self):
+        try:
+            for key, val in db.execute(
+                    "SELECT key, value FROM settings WHERE key LIKE 'uboard:%'"):
+                self.msg_ids[int(key.split(":", 1)[1])] = int(val)
+            if self.msg_ids:
+                log.info("restored %d per-user boards", len(self.msg_ids))
+        except sqlite3.OperationalError:
+            pass
+
+    def _history(self, uid):
+        tr = []
+        for ts, on in db.execute(
+                "SELECT ts, online FROM presence_events WHERE user_id=? "
+                "ORDER BY ts", (uid,)):
+            if tr and tr[-1][1] == on:
+                continue
+            tr.append((ts, on))
+        sessions, i = [], 0
+        while i < len(tr) - 1:
+            if tr[i][1] == 1 and tr[i + 1][1] == 0:
+                sessions.append((tr[i][0], tr[i + 1][0]))
+                i += 2
+            else:
+                i += 1
+        current_on = tr[-1][0] if tr and tr[-1][1] == 1 else None
+        last_off = tr[-1][0] if tr and tr[-1][1] == 0 else None
+        return sessions, current_on, last_off, (tr[0][0] if tr else None)
+
+    def build_text(self, uid):
+        sessions, cur_on, last_off, first_ts = self._history(uid)
+        now = time.time()
+        total = sum(b - a for a, b in sessions)
+        if cur_on:
+            total += now - cur_on
+        n_sessions = len(sessions) + (1 if cur_on else 0)
+        d = lambda t: datetime.fromtimestamp(t, tz=timezone.utc)
+
+        if cur_on:
+            head = "%s - online %s (%s)" % (
+                name_of(uid), d(cur_on).strftime("%H:%M"), short_dur(now - cur_on))
+        elif last_off:
+            head = "%s - last seen %s" % (
+                name_of(uid), d(last_off).strftime("%H:%M"))
+        else:
+            head = name_of(uid)
+
+        lines = [head]
+        shown = sessions[-BOARD_HISTORY:]
+        if shown:
+            lines.append("")
+            for a, b in shown[::-1]:
+                fa, fb = d(a), d(b)
+                same = fa.date() == fb.date()
+                lines.append("%s→%s (%s)" % (
+                    fa.strftime("%H:%M" if same else "%d %H:%M"),
+                    fb.strftime("%H:%M"), short_dur(b - a)))
+            if len(sessions) > BOARD_HISTORY:
+                lines.append("(+%d older)" % (len(sessions) - BOARD_HISTORY))
+        lines.append("")
+        lines.append("uptime %s - %d sessions%s" % (
+            short_dur(total), n_sessions,
+            (" - since %s" % d(first_ts).strftime("%d %b")) if first_ts else ""))
+        return "\n".join(lines)
+
+    async def run(self):
+        while True:
+            await asyncio.sleep(BOARD_EVERY)
+            if not self.dirty or not self.enabled():
+                continue
+            for uid in list(self.dirty)[:self.MAX_EDITS_PER_CYCLE]:
+                self.dirty.discard(uid)
+                try:
+                    text = self.build_text(uid)
+                    mid = self.msg_ids.get(uid)
+                    if mid:
+                        try:
+                            await self.client.edit_message(
+                                self.log_entity, mid, text, parse_mode=None)
+                            continue
+                        except MessageNotModifiedError:
+                            continue
+                        except FloodWaitError as e:
+                            log.warning("board edit flood-wait %ss", e.seconds)
+                            await asyncio.sleep(min(e.seconds + 5, 120))
+                            self.dirty.add(uid)
+                            continue
+                        except Exception:
+                            pass    # too old / deleted -> roll over to a new one
+                    msg = await self.client.send_message(
+                        self.log_entity, text, parse_mode=None)
+                    self.msg_ids[uid] = msg.id
+                    set_setting("uboard:%d" % uid, str(msg.id))
+                except Exception:
+                    log.exception("board update failed for %s", uid)
+                    self.dirty.add(uid)
+
+
 notifier = None  # created in main()
+boards = None    # created in main()
+
+
+def boards_touch(uid):
+    if boards is not None:
+        boards.touch(uid)
 
 
 # ----------------------------------------------------------------- client ---
@@ -527,9 +694,9 @@ def bind_group_handlers(entity):
             (chat_id, event.message.id, uid, time.time(), text,
              1 if event.message.media else 0))
         db.commit()
-        preview = ((event.raw_text or "")[:80]).replace("\n", " ") if LOG_MESSAGE_TEXT \
+        preview = ((event.raw_text or "")[:60]).replace("\n", " ") if LOG_MESSAGE_TEXT \
             else "(text not logged)"
-        notifier.tg("[%s] msg %s: %s" % (now_str(), name_of(uid), preview), 1)
+        notifier.tg("%s | %s: %s" % (now_min(), name_of(uid), preview), 1)
         check_flood(uid)
 
     @client.on(events.MessageEdited(chats=entity))
@@ -541,9 +708,9 @@ def bind_group_handlers(entity):
             (new, time.time(), chat_id, event.message.id))
         db.commit()
         if cur.rowcount:
-            notifier.tg("[%s] edited %s: %s" % (
-                now_str(), name_of(event.sender_id),
-                (new[:60] or "(media)")), 1)
+            notifier.tg("%s | %s edited: %s" % (
+                now_min(), name_of(event.sender_id),
+                ((new or "(media)")[:40])), 1)
 
     @client.on(events.MessageDeleted(chats=entity))
     async def on_delete(event):
@@ -559,8 +726,8 @@ def bind_group_handlers(entity):
             uid_row = db.execute(
                 "SELECT user_id FROM messages WHERE chat_id=? AND msg_id=?",
                 (chat_id, event.deleted_ids[0])).fetchone()
-            notifier.tg("[%s] deleted %d message(s) by %s" % (
-                now_str(), n, name_of(uid_row[0]) if uid_row else "unknown"), 1)
+            notifier.tg("%s | %s deleted %d msg(s)" % (
+                now_min(), name_of(uid_row[0]) if uid_row else "unknown", n), 1)
             if uid_row:
                 check_deletes(uid_row[0], n)
 
@@ -585,7 +752,7 @@ def bind_group_handlers(entity):
         else:
             return
         group_event(kind, data, uid)
-        notifier.tg("[%s] %s %s" % (now_str(), name_of(uid) if uid else "?", data), 1)
+        notifier.tg("%s | %s %s" % (now_min(), name_of(uid) if uid else "?", data), 1)
 
 
 def bind_command_handlers(log_entity):
@@ -622,10 +789,11 @@ def bind_command_handlers(log_entity):
                 "Watchdog status\n"
                 "level: %s  (/level alerts|notable|everything)\n"
                 "this run started: %s\n"
-                "members known: %d\n"
+                "members known: %d (boards: %d)\n"
                 "logged: %d presence, %d messages, %d group events" % (
                     cur, get_setting("run_started", "?"),
-                    n_users, n_pres, n_msg, n_ge))
+                    n_users, len(boards.msg_ids) if boards else 0,
+                    n_pres, n_msg, n_ge))
 
         elif cmd == "/report":
             import io
@@ -772,7 +940,7 @@ async def resolve_group():
 
 
 async def main():
-    global notifier, SELF_ID
+    global notifier, SELF_ID, boards
 
     if not (API_ID and API_HASH and GROUP):
         raise SystemExit("API_ID, API_HASH and GROUP must be set (see README.md)")
@@ -786,6 +954,8 @@ async def main():
     cleanup_bad_rows()
     notifier = Notifier(client, log_entity)
     await notifier.restore()
+    boards = UserBoards(client, log_entity)
+    await boards.restore()
 
     # Log level priority: "Run workflow" dropdown choice > /level command
     # setting (persisted in the database) > the workflow's default.
@@ -811,6 +981,7 @@ async def main():
     load_names()
     bind_group_handlers(entity)
     notifier.start()
+    client.loop.create_task(boards.run())
     await snapshot(entity)
     client.loop.create_task(presence_alerts())
 
@@ -829,7 +1000,15 @@ async def main():
         client.loop.create_task(resnap())
 
     log.info("watchdog running (Ctrl+C to stop)")
-    await client.run_until_disconnected()
+    while True:
+        try:
+            await client.run_until_disconnected()
+            log.warning("disconnected - retrying in 10s")
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
+            log.exception("connection error - retrying in 10s")
+        await asyncio.sleep(10)
 
 
 if __name__ == "__main__":

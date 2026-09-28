@@ -195,17 +195,35 @@ private log group, from the same account** — the bot obeys instantly:
 
 Levels: `alerts` = alert messages only; `notable` = alerts + messages,
 edits, deletions, joins/leaves, name changes; `everything` = all of that
-plus online/offline lines like `14:02 | abjj online` /
-`14:37 | abjj offline (35m)`.
+plus a per-member online/offline **board message** (see below).
 
-**Anti-spam output design**: events go to ONE rolling log message that is
-edited in place — a new message is sent only after it passes 100 lines
-(~3500 chars), exactly as requested. A separate LIVE REPORT message is
-re-edited every 10 minutes with the current top suspects, counts and top
-talkers, so the report is always up to date without any new messages.
-Alerts (floods, mass deletions, always-online) still arrive as their own
-messages since they are rare. Message ids persist in the database, so the
-rolling log and live report survive 6-hour handovers.
+**Anti-spam output design**: every member gets their **own board message**
+that is edited in place each time they come online / go offline — showing
+their recent sessions and a running total uptime that always sits at the
+bottom:
+
+```
+@abc - online 17:30 (34m)
+
+15:10→16:02 (52m)
+14:02→14:37 (35m)
+
+uptime 2h01m - 3 sessions - since 21 Sep
+```
+
+Boards are fully regenerated from the database on every change, so they
+survive restarts and 6-hour handovers, and Telegram's ~48h edit limit is
+handled automatically by rolling over into a fresh message. Edits are
+coalesced and rate-capped to stay far below flood limits. On top of that
+there is ONE rolling log message for notable events (new one only after
+100 lines) and a LIVE REPORT dashboard re-edited every 10 minutes with the
+current top suspects and stats. Alerts (floods, mass deletions,
+always-online) still arrive as their own messages since they are rare.
+
+Performance hardening: SQLite runs in WAL mode, duplicate/stale presence
+pushes are filtered before they touch the database, the live report is
+built on a separate connection in a worker thread (never blocks event
+capture), and the connection auto-retries on network errors.
 
 ## Security notes
 
