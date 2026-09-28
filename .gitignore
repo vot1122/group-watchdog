@@ -1,0 +1,8 @@
+# never commit these - session/env = your account, db = private data
+.env
+*.session
+presence.db
+presence.db.enc
+watchdog.log
+__pycache__/
+venv/

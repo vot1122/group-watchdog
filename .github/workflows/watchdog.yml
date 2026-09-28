@@ -1,0 +1,87 @@
+name: watchdog
+
+# Relay design for the 6-hour job limit:
+#   - scheduled every 5 minutes: if a healthy runner is already watching
+#     (fresh heartbeat on the `state` branch), the run exits immediately
+#   - otherwise it restores the saved database, runs the bot for ~5h48m,
+#     then saves state; the next scheduled run takes over within minutes.
+#   - the Telegram session comes from the SESSION_STRING secret (never a
+#     file in the repo); the database is only ever pushed AES-encrypted.
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: watchdog-runner
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  watchdog:
+    runs-on: ubuntu-latest
+    timeout-minutes: 358
+    env:
+      API_ID: ${{ secrets.API_ID }}
+      API_HASH: ${{ secrets.API_HASH }}
+      SESSION_STRING: ${{ secrets.SESSION_STRING }}
+      GROUP: ${{ secrets.GROUP }}
+      LOG_GROUP: ${{ secrets.LOG_GROUP }}
+      NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+      NTFY_SERVER: https://ntfy.sh
+      TG_LOG_LEVEL: notable
+      LOG_MESSAGE_TEXT: "0"
+      SNAPSHOT_EVERY: "30"
+      PRUNE_DAYS: "30"
+      DB_PASS: ${{ secrets.DB_PASS }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check heartbeat (is another runner already watching?)
+        run: |
+          git fetch origin state --depth=1 2>/dev/null || true
+          SKIP=false
+          if git cat-file -e origin/state:heartbeat 2>/dev/null; then
+            HB=$(git show origin/state:heartbeat | tr -d '[:space:]')
+            [ -z "$HB" ] && HB=0
+            AGE=$(( $(date +%s) - HB ))
+            echo "Last heartbeat: ${AGE}s ago"
+            if [ "$AGE" -lt 300 ]; then
+              echo "A runner is already active - standing down."
+              SKIP=true
+            fi
+          fi
+          echo "SKIP=$SKIP" >> "$GITHUB_ENV"
+
+      - name: Restore saved state
+        if: env.SKIP != 'true'
+        run: |
+          set -e
+          python -m pip install --quiet telethon
+          if git cat-file -e origin/state:presence.db.enc 2>/dev/null; then
+            git show origin/state:presence.db.enc > presence.db.enc
+            openssl enc -aes-256-cbc -pbkdf2 -d \
+              -in presence.db.enc -pass env:DB_PASS | gunzip > presence.db
+            rm presence.db.enc
+            echo "Restored database from state branch."
+          else
+            echo "No saved database yet - starting fresh."
+          fi
+
+      - name: Run watchdog (~5h48m, then hand over to the next run)
+        if: env.SKIP != 'true'
+        run: |
+          bash sync_state.sh &                       # claim the lock immediately
+          ( while true; do sleep 240; bash sync_state.sh >/dev/null 2>&1 || true; done ) &
+          SIDECAR=$!
+          CODE=0
+          timeout --signal=SIGINT --kill-after=90 348m python bot.py || CODE=$?
+          kill "$SIDECAR" 2>/dev/null || true
+          bash sync_state.sh full                     # final, complete state push
+          # 124/130 = our own planned stop (timeout / SIGINT) - not a failure
+          case "$CODE" in 0|124|130) exit 0 ;; *) exit "$CODE" ;; esac
