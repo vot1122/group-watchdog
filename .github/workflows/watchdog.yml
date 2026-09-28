@@ -66,10 +66,19 @@ jobs:
           python -m pip install --quiet telethon
           if git cat-file -e origin/state:presence.db.enc 2>/dev/null; then
             git show origin/state:presence.db.enc > presence.db.enc
-            openssl enc -aes-256-cbc -pbkdf2 -d \
-              -in presence.db.enc -pass env:DB_PASS | gunzip > presence.db
+            # try the hardened 310k-iteration format first, fall back to the
+            # legacy 10k format for the blob already on the state branch
+            openssl enc -aes-256-cbc -pbkdf2 -iter 310000 -d \
+              -in presence.db.enc -pass env:DB_PASS 2>/dev/null | gunzip > presence.db \
+              || openssl enc -aes-256-cbc -pbkdf2 -d \
+                   -in presence.db.enc -pass env:DB_PASS 2>/dev/null | gunzip > presence.db
+            if [ -s presence.db ]; then
+              echo "Restored database from state branch."
+            else
+              echo "Failed to decrypt presence.db.enc - check the DB_PASS secret."
+              exit 1
+            fi
             rm presence.db.enc
-            echo "Restored database from state branch."
           else
             echo "No saved database yet - starting fresh."
           fi

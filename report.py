@@ -132,7 +132,7 @@ def score(m, msg=None, churn=0):
     msg = msg or {}
 
     # --- spam signals (message behaviour) ---
-    if msg.get("peak") and msg["peak"] > 100:
+    if msg.get("peak") and msg["peak"] > 150:
         s += 20
         reasons.append("flood: %d msgs/hour" % msg["peak"])
     if msg.get("deleted", 0) >= 5 and msg.get("sent") and \
@@ -150,7 +150,9 @@ def score(m, msg=None, churn=0):
         return min(s, 100), reasons
 
     if m["uptime_ratio"] is not None and m["uptime_ratio"] >= 0.98 and m["window_h"] >= 24:
-        s += 40
+        # under 48h of observation a single no-sleep stint can look like
+        # 24/7 - award the full weight only once two full days back it up
+        s += 40 if m["window_h"] >= 48 else 24
         reasons.append("online 24/7")
     if m["gap_cv"] is not None and m["gap_cv"] < 0.15 and len(m["gaps"]) >= 10:
         s += 25
@@ -221,21 +223,84 @@ def churn_stats(db):
 
 
 # ----------------------------------------------------------------- output ---
+def _monitor_cutoff(db):
+    """Events dated before the monitor started are Telegram-backfilled
+    last-seen timestamps (sometimes months old), not observations -
+    scoring must ignore them or window_h / uptime get skewed."""
+    try:
+        row = db.execute(
+            "SELECT value FROM settings WHERE key='monitor_since'").fetchone()
+        return float(row[0]) if row else 0.0
+    except (sqlite3.OperationalError, TypeError, ValueError):
+        return 0.0
+
+
+def _observed_events(db):
+    """All presence events, trimmed to the actual monitoring window."""
+    events = {}
+    for uid, ts, online in db.execute(
+            "SELECT user_id, ts, online FROM presence_events ORDER BY ts"):
+        events.setdefault(uid, []).append((ts, online))
+    cutoff = _monitor_cutoff(db)
+    if cutoff:
+        events = {uid: [r for r in rows if r[0] >= cutoff]
+                  for uid, rows in events.items()}
+        events = {uid: rows for uid, rows in events.items() if rows}
+    return events
+
+
+def co_presence(events, min_trans=12, tol=20, ratio=0.8):
+    """Accounts whose presence transitions repeatedly happen within seconds
+    of each other - the signature of one operator (or clone tooling)
+    running several accounts. Returns {uid: (partner, ratio_a, ratio_b)}.
+    Conservative on purpose: both accounts need 12+ transitions and 80% of
+    each account's transitions synced within a 20s window."""
+    trans = {}
+    for uid, rows in events.items():
+        tr = []
+        for ts, on in rows:
+            if tr and tr[-1][1] == on:
+                continue
+            tr.append((ts, on))
+        if len(tr) >= min_trans:
+            trans[uid] = [t for t, _ in tr]
+
+    def synced(x, y):
+        c = k = 0
+        for t in x:
+            while k < len(y) and y[k] < t - tol:
+                k += 1
+            if k < len(y) and y[k] <= t + tol:
+                c += 1
+        return c
+
+    out = {}
+    uids = sorted(trans)
+    for i in range(len(uids)):
+        for j in range(i + 1, len(uids)):
+            a, b = trans[uids[i]], trans[uids[j]]
+            ca, cb = synced(a, b), synced(b, a)
+            if ca >= ratio * len(a) and cb >= ratio * len(b):
+                out[uids[i]] = (uids[j], ca / len(a), cb / len(b))
+                out[uids[j]] = (uids[i], cb / len(b), ca / len(a))
+    return out
+
 
 def build_report(db):
     users = {r[0]: {"username": r[1], "display_name": r[2], "is_bot": r[3]}
              for r in db.execute(
                  "SELECT user_id, username, display_name, is_bot FROM users")}
 
-    events = {}
-    for uid, ts, online in db.execute(
-            "SELECT user_id, ts, online FROM presence_events ORDER BY ts"):
-        events.setdefault(uid, []).append((ts, online))
+    events = _observed_events(db)
 
     msg = message_stats(db)
     churn, joins_leaves = churn_stats(db)
     known_bots = {uid for uid, u in users.items() if u["is_bot"]}
     no_data = [uid for uid in users if uid not in events]
+
+    def uname(uid):
+        u = users.get(uid, {})
+        return u.get("username") or uid
 
     results = []
     for uid, rows in events.items():
@@ -245,11 +310,16 @@ def build_report(db):
         s, reasons = score(m, m["msg"], m["churn"])
         m["score"], m["reasons"] = s, reasons
         results.append(m)
-    results.sort(key=lambda x: -x["score"])
 
-    def uname(uid):
-        u = users.get(uid, {})
-        return u.get("username") or uid
+    # co-presence: accounts that move in lockstep (one operator, many bots)
+    pairs = co_presence(events)
+    for m in results:
+        p = pairs.get(m["user_id"])
+        if p:
+            m["score"] = min(100, m["score"] + 35)
+            m["reasons"].append("moves in sync with %s (%d%% of transitions)"
+                                % (uname(p[0]), round(100 * p[1])))
+    results.sort(key=lambda x: -x["score"])
 
     lines = []
     a = lines.append
@@ -277,6 +347,23 @@ def build_report(db):
             human(m["longest_gap"]), m["active_h"],
             ms.get("sent", "-"), ms.get("deleted", "-")))
     a("")
+
+    if pairs:
+        a("### Coordinated accounts (presence moves together)")
+        a("")
+        a("These accounts go online/offline within seconds of each other on"
+          " most of their transitions - a strong sign of one operator or")
+        a("clone tooling. Verify manually before acting.")
+        a("")
+        seen_pairs = set()
+        for uid, (other, ra, rb) in pairs.items():
+            key = tuple(sorted((uid, other)))
+            if key in seen_pairs:
+                continue
+            seen_pairs.add(key)
+            a("- **%s** and **%s** - %d%% / %d%% of their transitions synced"
+              % (uname(uid), uname(other), round(100 * ra), round(100 * rb)))
+        a("")
 
     heavy_deleters = [(m["msg"]["deleted"], m["msg"]["sent"], m)
                       for m in results if m["msg"] and m["msg"]["deleted"] >= 3]
@@ -427,10 +514,7 @@ def compact_report(db, limit=6):
     users = {r[0]: {"username": r[1], "display_name": r[2]}
              for r in db.execute(
                  "SELECT user_id, username, display_name, is_bot FROM users")}
-    events = {}
-    for uid, ts, online in db.execute(
-            "SELECT user_id, ts, online FROM presence_events ORDER BY ts"):
-        events.setdefault(uid, []).append((ts, online))
+    events = _observed_events(db)
     msg = message_stats(db)
     churn, _ = churn_stats(db)
     results = []

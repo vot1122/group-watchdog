@@ -184,10 +184,14 @@ needs one secret:
 `PAT_TOKEN` is what keeps the watchdog alive without cron: GitHub refuses
 workflow-dispatch calls made with the built-in `GITHUB_TOKEN`, so the bot
 uses your personal access token to dispatch the next run of the chain, and
-the `guard` + `keepalive` workflows use it too. Classic PAT with `repo`
-scope (fine-grained with Contents read/write + Actions read/write on this
-repo also works); set a long or no expiry. If it ever expires, the chain
-stops and the guard/keepalive jobs will say so in their logs.
+the `guard` + `keepalive` workflows use it too. **Prefer a fine-grained PAT
+scoped to only this repository** with Contents read/write + Actions
+read/write — a classic `repo`-scoped PAT also works but is far more powerful
+than this needs. Set a long or no expiry. **If the PAT expires, the chain
+stops and the guard cannot restart it either (it needs the same token) —
+renew the PAT, then start the watchdog workflow manually.** For any other
+chain break (failed dispatch, manual cancel) the guard covers it within
+~30 minutes.
 
 If the workflow ever shows as disabled anyway, open the Actions tab and hit
 "Enable workflow" — you'll also see a "This workflow will be disabled soon"

@@ -248,6 +248,8 @@ def record_presence(user_id, online, ts, source="update"):
                 LAST_STATE[user_id] = (ts, online)
             return False
         if ts <= lts - 2:            # stale / out-of-order event
+            log.debug("dropped stale presence event for %s (ts=%d, last=%d)",
+                      user_id, ts, lts)
             return False
     db.execute(
         "INSERT INTO presence_events (user_id, online, ts, source) VALUES (?,?,?,?)",
@@ -553,7 +555,7 @@ class UserBoards:
     message.
     """
 
-    MAX_EDITS_PER_CYCLE = 15
+    MAX_EDITS_PER_CYCLE = 10   # + 0.5s pause between edits -> ~1 edit/sec max
 
     def __init__(self, client, log_entity):
         self.client = client
@@ -598,10 +600,12 @@ class UserBoards:
             pass
 
     def _history(self, uid):
+        rows = db.execute(
+            "SELECT ts, online FROM presence_events WHERE user_id=? "
+            "ORDER BY ts DESC LIMIT 2000", (uid,)).fetchall()
+        rows.reverse()
         tr = []
-        for ts, on in db.execute(
-                "SELECT ts, online FROM presence_events WHERE user_id=? "
-                "ORDER BY ts", (uid,)):
+        for ts, on in rows:
             if tr and tr[-1][1] == on:
                 continue
             tr.append((ts, on))
@@ -683,6 +687,7 @@ class UserBoards:
                 except Exception:
                     log.exception("board update failed for %s", uid)
                     self.dirty.add(uid)
+                await asyncio.sleep(0.5)   # stay well under Telegram edit limits
 
 
 notifier = None  # created in main()
@@ -709,7 +714,19 @@ async def on_user_update(event):
 
 
 FLOOD = {}   # uid -> deque of message timestamps
+_LAST_REPORT = [0.0]   # mutable so the command handler can update it
 DELETES = {} # uid -> deque of deletion timestamps
+_LAST_ALERT = {}   # alert kind -> last fired ts (global cooldown)
+
+
+def _alert_allowed(kind, cooldown=60):
+    """One alert per kind per minute: a coordinated spam wave across many
+    accounts must not produce a wall of alert messages."""
+    now = time.time()
+    if now - _LAST_ALERT.get(kind, 0) < cooldown:
+        return False
+    _LAST_ALERT[kind] = now
+    return True
 
 
 def check_flood(uid):
@@ -720,9 +737,10 @@ def check_flood(uid):
         dq.popleft()
     if len(dq) >= FLOOD_MSGS:
         dq.clear()  # fire once per burst
-        asyncio.ensure_future(notifier.alert(
-            "Message flood",
-            "%s sent %d+ messages in under %ds" % (name_of(uid), FLOOD_MSGS, FLOOD_WINDOW)))
+        if _alert_allowed("flood"):
+            asyncio.ensure_future(notifier.alert(
+                "Message flood",
+                "%s sent %d+ messages in under %ds" % (name_of(uid), FLOOD_MSGS, FLOOD_WINDOW)))
 
 
 def check_deletes(uid, count):
@@ -734,9 +752,10 @@ def check_deletes(uid, count):
         dq.popleft()
     if len(dq) >= DELETE_ALERT:
         dq.clear()
-        asyncio.ensure_future(notifier.alert(
-            "Mass deletion",
-            "%s deleted %d+ messages in under %ds" % (name_of(uid), DELETE_ALERT, FLOOD_WINDOW)))
+        if _alert_allowed("deletes"):
+            asyncio.ensure_future(notifier.alert(
+                "Mass deletion",
+                "%s deleted %d+ messages in under %ds" % (name_of(uid), DELETE_ALERT, FLOOD_WINDOW)))
 
 
 def bind_group_handlers(entity):
@@ -778,22 +797,23 @@ def bind_group_handlers(entity):
 
     @client.on(events.MessageDeleted(chats=entity))
     async def on_delete(event):
-        n = 0
+        # attribute each deleted message to ITS author - a deletion batch can
+        # contain messages from several users (e.g. an admin purge)
+        per_user = {}
         for mid in event.deleted_ids:
-            cur = db.execute(
-                "UPDATE messages SET deleted=1, deleted_ts=? "
-                "WHERE chat_id=? AND msg_id=? AND deleted=0",
-                (time.time(), chat_id, mid))
-            n += cur.rowcount
+            row = db.execute(
+                "SELECT user_id, deleted FROM messages "
+                "WHERE chat_id=? AND msg_id=?", (chat_id, mid)).fetchone()
+            if row and not row[1]:
+                db.execute(
+                    "UPDATE messages SET deleted=1, deleted_ts=? "
+                    "WHERE chat_id=? AND msg_id=?", (time.time(), chat_id, mid))
+                if row[0]:
+                    per_user[row[0]] = per_user.get(row[0], 0) + 1
         db.commit()
-        if n:
-            uid_row = db.execute(
-                "SELECT user_id FROM messages WHERE chat_id=? AND msg_id=?",
-                (chat_id, event.deleted_ids[0])).fetchone()
-            notifier.tg("%s | %s deleted %d msg(s)" % (
-                now_min(), name_of(uid_row[0]) if uid_row else "unknown", n), 1)
-            if uid_row:
-                check_deletes(uid_row[0], n)
+        for uid, n in per_user.items():
+            notifier.tg("%s | %s deleted %d msg(s)" % (now_min(), name_of(uid), n), 1)
+            check_deletes(uid, n)
 
     @client.on(events.ChatAction(chats=entity))
     async def on_chat_action(event):
@@ -860,6 +880,10 @@ def bind_command_handlers(log_entity):
                     n_pres, n_msg, n_ge))
 
         elif cmd == "/report":
+            if time.time() - _LAST_REPORT[0] < 60:
+                await event.reply("Report cooling down - try again in a minute.")
+                return
+            _LAST_REPORT[0] = time.time()
             import io
             import report as rep
             try:

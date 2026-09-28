@@ -42,14 +42,25 @@ variables → Actions → "New repository secret". Add, one by one:
 - `GROUP` — your group's link / @username / -100... id
 - (optional) `LOG_GROUP`, `NTFY_TOPIC`
 - `PAT_TOKEN` — **required** — a personal access token with access to
-  this repo (classic PAT with `repo` scope, or fine-grained with Contents
-  read/write + Actions read/write on this repo only). This is what keeps
-  the watchdog running 24/7: GitHub refuses chain-dispatches with the
-  built-in token, so the bot uses your PAT to start its own successor run
-  every ~5.5 hours, and the `guard` + `keepalive` workflows use it too.
-  Without it the chain stops after the first ~5.5-hour run.
+  this repo. **Prefer a fine-grained PAT scoped to only this repository,
+  with just Contents read/write + Actions read/write** (a classic PAT with
+  `repo` scope also works but is far more powerful than needed). This is
+  what keeps the watchdog running 24/7: GitHub refuses chain-dispatches
+  with the built-in token, so the bot uses your PAT to start its own
+  successor run every ~5.5 hours, and the `guard` + `keepalive`
+  workflows use it too. Without it the chain stops after the first
+  ~5.5-hour run.
 
 Leave `SESSION_STRING` for the next step.
+
+**If you ever suspect the SESSION_STRING or your account was compromised:**
+
+1. Telegram app → Settings → Devices → terminate every session you don't
+   recognize (or all of them).
+2. Revoke the API app: log in at my.telegram.org → API development tools
+   → delete/reset the app.
+3. Run `python generate_session.py` again, update the `SESSION_STRING`
+   secret, and restart the workflow.
 
 ### 0.4 Generate SESSION_STRING in Termux (once)
 

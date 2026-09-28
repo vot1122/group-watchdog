@@ -34,8 +34,10 @@ date +%s > "$STATE_DIR/heartbeat"
 
 if [ "$INCLUDE_DB" = "1" ] && [ -f presence.db ]; then
     # Safe snapshot while the bot is writing (SQLite online backup).
+    # 310k PBKDF2 iterations (OWASP recommendation; the openssl default
+    # of 10k is weak for short passphrases).
     sqlite3 presence.db ".backup /tmp/state-snap.db"
-    gzip -c /tmp/state-snap.db | openssl enc -aes-256-cbc -pbkdf2 -salt \
+    gzip -c /tmp/state-snap.db | openssl enc -aes-256-cbc -pbkdf2 -iter 310000 -salt \
         -out "$STATE_DIR/presence.db.enc" -pass env:DB_PASS
 fi
 
