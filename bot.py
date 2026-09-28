@@ -31,7 +31,9 @@ from telethon import TelegramClient, events
 from telethon.errors import FloodWaitError, MessageNotModifiedError
 from telethon.sessions import StringSession
 from telethon.tl.functions.messages import CheckChatInviteRequest
-from telethon.tl.types import ChatInviteAlready, UserStatusOnline, UserStatusOffline
+from telethon.tl.types import (ChatInviteAlready, UserStatusOnline,
+                               UserStatusOffline, UserStatusRecently,
+                               UserStatusLastWeek, UserStatusLastMonth)
 
 # ----------------------------------------------------------------- config ---
 
@@ -363,7 +365,15 @@ def record_status(user_id, status, source):
             ts = min(ts, time.time())
         if record_presence(user_id, 0, ts, source) and fresh:
             boards_touch(user_id)
-    # UserStatusRecently / LastWeek / LastMonth: hidden by privacy, untrackable.
+    elif isinstance(status, (UserStatusRecently, UserStatusLastWeek,
+                             UserStatusLastMonth)):
+        # Hidden last-seen: the user is definitely NOT online right now -
+        # we just can't know the exact moment they went offline. Without
+        # this, such a member would tick "online" forever with a running
+        # timer and an inflating uptime (which also poisons the 24/7
+        # spam signal). Record the moment we learned it instead.
+        if record_presence(user_id, 0, time.time(), "privacy") and fresh:
+            boards_touch(user_id)
 
 
 # -------------------------------------------------------------- forwarding --
