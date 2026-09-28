@@ -10,6 +10,104 @@ verification only.
 
 ---
 
+## Part 0 — Mobile-only setup (Android: Termux + browser, no PC)
+
+Everything in this guide works from a phone. Only one step needs Termux
+(generating your session string, once). For all websites below, open them in
+Chrome with "Desktop site" ticked (⋮ menu) — GitHub and my.telegram.org hide
+some buttons on the mobile layout.
+
+### 0.1 Install Termux (one time)
+
+Install Termux from **F-Droid** (f-droid.org) or from GitHub releases — the
+Play Store version is outdated and broken on newer Androids. Just search
+"Termux F-Droid" in your browser, install the F-Droid store app, then Termux
+from inside it.
+
+### 0.2 Telegram prep (all inside the Telegram app + browser)
+
+Do Part 1 below, all from your phone: 2FA in the app, my.telegram.org in the
+browser (log in with your phone number; the code arrives inside the Telegram
+app), create your log group in the app, install the ntfy app from the Play
+Store and subscribe to a long random topic.
+
+### 0.3 Add the GitHub secrets (mobile browser)
+
+Open https://github.com/vot1122/group-watchdog → Settings → Secrets and
+variables → Actions → "New repository secret". Add, one by one:
+
+- `API_ID` — from my.telegram.org
+- `API_HASH` — from my.telegram.org
+- `DB_PASS` — any long random string you invent
+- `GROUP` — your group's link / @username / -100... id
+- (optional) `LOG_GROUP`, `NTFY_TOPIC`
+
+Leave `SESSION_STRING` for the next step.
+
+### 0.4 Generate SESSION_STRING in Termux (once)
+
+Open Termux and run:
+
+```
+pkg update -y && pkg install -y python git
+git clone https://github.com/vot1122/group-watchdog
+cd group-watchdog
+pip install telethon
+python generate_session.py
+```
+
+Enter API_ID, API_HASH, then your phone number (+91...) and the code
+Telegram sends to your app. The script prints your SESSION_STRING and saves
+it to session.txt. Copy it either way:
+
+- easy way: `pkg install termux-api` + install the "Termux:API" app
+  (F-Droid), then run `cat session.txt | termux-clipboard-set`
+- manual way: `cat session.txt`, long-press the line, Select all → Copy
+
+Now add it as the final secret `SESSION_STRING` in the repo settings
+(step 0.3).
+
+### 0.5 Start the watchdog (mobile browser)
+
+Repo → Actions tab → select "watchdog" → "Run workflow" → Run. Open the
+running job and wait for `watchdog running`. Done — after this it relays
+itself around GitHub's 6-hour job limit automatically (see Option A in
+Part 3 for what to expect in the Actions list).
+
+### 0.6 Reports on your phone (any time)
+
+1. Browser → repo → Code → branch dropdown → `state` → tap `presence.db.enc`
+   → download it (lands in your Downloads folder).
+2. Termux:
+
+```
+termux-setup-storage                     # allow file access (once)
+pkg install -y openssl
+cp ~/storage/downloads/presence.db.enc .
+openssl enc -aes-256-cbc -pbkdf2 -d -in presence.db.enc \
+  -pass pass:YOUR_DB_PASS | gunzip > presence.db
+python report.py --db presence.db -o report.md
+cat report.md                           # or: termux-open report.md
+```
+
+### 0.7 Optional: run the bot in Termux instead of GitHub Actions
+
+Your phone can also BE the server (free, fully continuous):
+
+```
+cd group-watchdog
+termux-wake-lock
+python bot.py
+```
+
+Then in Android settings: Settings → Apps → Termux → Battery → Unrestricted,
+so Android doesn't kill it. Honest downsides: Android may still stop it after
+days, phone reboots kill it, and it drains battery — the GitHub relay is more
+reliable long-term. But for a trial week, it's the simplest option of all,
+and the same `session.txt`/`watchdog.session` works for both.
+
+---
+
 ## Part 1 — One-time Telegram prep (15 minutes, on your phone/PC)
 
 ### 1.1 Turn on two-step verification on your account
