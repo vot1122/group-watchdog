@@ -241,9 +241,12 @@ class Notifier:
     Telegram flood limits in an active group.
     """
 
-    def __init__(self, client):
+    def __init__(self, client, log_entity=None):
         self.client = client
+        self.log_entity = log_entity
         self.tg_level = LEVELS.get(TG_LOG_LEVEL, 2) if LOG_GROUP else -1
+        if LOG_GROUP and log_entity is None:
+            self.tg_level = -1  # unresolved log group - disable forwarding
         self.ntfy_level = LEVELS.get(NTFY_LEVEL, 0) if NTFY_TOPIC else -1
         self.pending = []        # alerts + notable
         self.presence_buf = []   # presence lines (batched slowly)
@@ -291,7 +294,7 @@ class Notifier:
             try:
                 text = "\n".join(lines)
                 for i in range(0, len(text), 4000):
-                    await self.client.send_message(LOG_GROUP, text[i:i + 4000])
+                    await self.client.send_message(self.log_entity, text[i:i + 4000])
             except FloodWaitError as e:
                 log.warning("flood-wait %ss - requeueing log batch", e.seconds)
                 buf[:0] = lines
@@ -479,6 +482,50 @@ async def presence_alerts():
             log.exception("presence alert check failed")
 
 
+async def _find_entity(want):
+    """get_entity by raw id fails on a fresh StringSession (no cached
+    access_hashes), so fall back to scanning the account's dialogs."""
+    try:
+        return await client.get_entity(want)
+    except Exception:
+        pass
+    if isinstance(want, int):
+        async for d in client.iter_dialogs():
+            if d.id == want or (want > 0 and d.id == -1000000000000 - want):
+                return d.entity
+    else:
+        name = want.lstrip("@").lower()
+        async for d in client.iter_dialogs():
+            u = getattr(d.entity, "username", None) if d.entity else None
+            if u and u.lower() == name:
+                return d.entity
+    return None
+
+
+async def resolve_log_group():
+    """Resolve LOG_GROUP to an entity (same StringSession caveat applies)."""
+    if not LOG_GROUP:
+        return None
+    g = LOG_GROUP.strip().replace("https://t.me/", "@").replace("t.me/", "@")
+    if g.lstrip("-").isdigit():
+        want = int(g)
+        cands = [want]
+        if want > 0:
+            cands.append(-1000000000000 - want)   # supergroup marked form
+        for c in cands:
+            ent = await _find_entity(c)
+            if ent is not None:
+                return ent
+        log.warning("LOG_GROUP %s could not be resolved - "
+                    "log-group forwarding disabled", LOG_GROUP)
+        return None
+    ent = await _find_entity(g if g.startswith("@") else "@" + g)
+    if ent is None:
+        log.warning("LOG_GROUP %s could not be resolved - "
+                    "log-group forwarding disabled", LOG_GROUP)
+    return ent
+
+
 async def resolve_group():
     """Accepts @username, a numeric -100... id, a t.me/username link,
     or an invite link (t.me/+hash / t.me/joinchat/hash) for a group you
@@ -494,7 +541,9 @@ async def resolve_group():
         # private channel link like t.me/c/1234567890 - convert to internal id
         internal = g.split("c/", 1)[1].split("/")[0]
         if internal.isdigit():
-            return await client.get_entity(int("-100" + internal))
+            ent = await _find_entity(int("-100" + internal))
+            if ent is not None:
+                return ent
 
     if g.startswith("joinchat/") or g.startswith("+"):
         invite_hash = g.split("/")[-1].lstrip("+")
@@ -506,8 +555,15 @@ async def resolve_group():
             "Join it first with your account, then restart the bot.")
 
     if g.lstrip("-").isdigit():
-        return await client.get_entity(int(g))
-    return await client.get_entity(g)
+        want = int(g)
+    else:
+        want = g
+    ent = await _find_entity(want)
+    if ent is None:
+        raise SystemExit(
+            "Could not resolve GROUP %r. Make sure your account is a member "
+            "of the group, or use its @username / invite link instead." % GROUP)
+    return ent
 
 
 async def main():
@@ -521,7 +577,8 @@ async def main():
     SELF_ID = me.id
     log.info("logged in as %s", me.first_name)
 
-    notifier = Notifier(client)
+    log_entity = await resolve_log_group()
+    notifier = Notifier(client, log_entity)
     entity = await resolve_group()
     log.info("watching group: %s", getattr(entity, "title", GROUP))
     log.info("destinations: log-group=%s (level %s), ntfy=%s (level %s)",

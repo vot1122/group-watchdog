@@ -75,6 +75,8 @@ jobs:
 
       - name: Run watchdog (~5h48m, then hand over to the next run)
         if: env.SKIP != 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           bash sync_state.sh &                       # claim the lock immediately
           ( while true; do sleep 240; bash sync_state.sh >/dev/null 2>&1 || true; done ) &

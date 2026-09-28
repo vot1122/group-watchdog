@@ -10,6 +10,11 @@
 set -u
 cd "$(dirname "$0")"
 
+if [ -z "${GITHUB_TOKEN:-}" ]; then
+    echo "sync_state.sh: GITHUB_TOKEN is not set - cannot push state" >&2
+    exit 1
+fi
+
 MODE=${1:-}
 
 # Heartbeat every call; the database every 8th call (~every 32 min) or when
