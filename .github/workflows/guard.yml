@@ -1,0 +1,45 @@
+name: guard
+
+# Safety net for the PAT chain (not the relay itself - watchdog.yml chains
+# itself via PAT_TOKEN). Every 30 minutes: if NO watchdog run is running or
+# queued, dispatch a fresh one. Covers a broken chain, an expired PAT, a
+# failed run, or a run you cancelled manually. Costs a 5-second job per tick.
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+
+permissions:
+  actions: write
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Resurrect watchdog if it died
+        env:
+          PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
+        run: |
+          if [ -z "$PAT_TOKEN" ]; then
+            echo "PAT_TOKEN secret is MISSING - guard cannot dispatch. Add it!"
+            exit 1
+          fi
+          AUTH="Authorization: Bearer $PAT_TOKEN"
+          API="https://api.github.com/repos/${GITHUB_REPOSITORY}"
+          # any watchdog run alive (running, queued or waiting)?
+          ACTIVE=$(curl -sf -H "$AUTH" -H "Accept: application/vnd.github+json" \
+            "$API/actions/workflows/watchdog.yml/runs?per_page=15" \
+            | jq '[.workflow_runs[]
+                   | select(.status == "in_progress" or .status == "queued" or .status == "waiting")]
+                  | length')
+          echo "active watchdog runs: $ACTIVE"
+          if [ "$ACTIVE" = "0" ]; then
+            echo "Watchdog is DOWN - dispatching a fresh run."
+            curl -sf -X POST -H "$AUTH" -H "Accept: application/vnd.github+json" \
+              "$API/actions/workflows/watchdog.yml/dispatches" \
+              -d '{"ref":"main"}'
+          else
+            echo "Watchdog alive - nothing to do."
+          fi

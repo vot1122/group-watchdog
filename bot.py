@@ -78,6 +78,15 @@ LOG_MESSAGE_TEXT = os.environ.get("LOG_MESSAGE_TEXT", "1") == "1"
 BOARD_EVERY = int(os.environ.get("BOARD_EVERY", "5"))       # flush cycle, seconds
 BOARD_HISTORY = int(os.environ.get("BOARD_HISTORY", "12"))    # sessions kept per board
 
+# --- PAT self-chain ---------------------------------------------------------
+# The 5-minute cron relay is gone: ~30 min before the Actions job limit this
+# run dispatches the NEXT run itself with PAT_TOKEN (GitHub refuses
+# chain-dispatches via the built-in GITHUB_TOKEN), then exits cleanly. The
+# new run has been queuing behind us the whole time (concurrency group,
+# cancel-in-progress: false) so nothing is ever cancelled mid-flight.
+CHAIN_AFTER_MIN = int(os.environ.get("CHAIN_AFTER_MIN", "330"))  # 0 = off
+PAT_TOKEN = os.environ.get("PAT_TOKEN", "")
+
 # --- alert thresholds ---------------------------------------------------
 FLOOD_MSGS = int(os.environ.get("FLOOD_MSGS", "20"))      # messages ...
 FLOOD_WINDOW = int(os.environ.get("FLOOD_WINDOW", "60"))   # ... within N seconds
@@ -939,6 +948,46 @@ async def resolve_group():
     return ent
 
 
+_chained = False   # True once the next run has been dispatched successfully
+
+
+async def chain_next_run():
+    """Dispatch the next workflow run with the PAT near the end of the job
+    window, then stop this one cleanly so the final state push happens.
+    On failure we simply keep watching until the hard timeout - the guard
+    workflow resurrects the chain."""
+    global _chained
+    if not CHAIN_AFTER_MIN:
+        return
+    if not PAT_TOKEN:
+        log.warning("PAT_TOKEN not set - self-chain disabled; add the secret "
+                    "or the guard workflow has to resurrect every handover")
+        return
+    repo = os.environ.get("GITHUB_REPOSITORY", "")
+    if not repo:
+        log.warning("GITHUB_REPOSITORY not set - not running on Actions?")
+        return
+    await asyncio.sleep(CHAIN_AFTER_MIN * 60)
+    import json as _json
+    import urllib.request as _rq
+    req = _rq.Request(
+        "https://api.github.com/repos/%s/actions/workflows/watchdog.yml/dispatches" % repo,
+        data=_json.dumps({"ref": "main"}).encode("utf-8"),
+        headers={"Authorization": "Bearer " + PAT_TOKEN,
+                 "Accept": "application/vnd.github+json"},
+        method="POST")
+    try:
+        with _rq.urlopen(req, timeout=30) as r:
+            log.info("next run dispatched (HTTP %s) - it queues behind us "
+                     "and starts the moment we finish", r.status)
+    except Exception as e:
+        log.error("CHAIN DISPATCH FAILED (%r) - continuing until the hard "
+                  "timeout; guard workflow will resurrect us", e)
+        return
+    _chained = True
+    await client.disconnect()
+
+
 async def main():
     global notifier, SELF_ID, boards
 
@@ -1000,9 +1049,14 @@ async def main():
         client.loop.create_task(resnap())
 
     log.info("watchdog running (Ctrl+C to stop)")
+    if CHAIN_AFTER_MIN:
+        client.loop.create_task(chain_next_run())
     while True:
         try:
             await client.run_until_disconnected()
+            if _chained:
+                log.info("successor is queued - handing over now")
+                break
             log.warning("disconnected - retrying in 10s")
         except (KeyboardInterrupt, SystemExit):
             raise

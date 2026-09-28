@@ -41,12 +41,13 @@ variables → Actions → "New repository secret". Add, one by one:
 - `DB_PASS` — any long random string you invent
 - `GROUP` — your group's link / @username / -100... id
 - (optional) `LOG_GROUP`, `NTFY_TOPIC`
-- (optional but recommended) `PAT_TOKEN` — a personal access token with
-  access to this repo (classic PAT with `repo` scope, or fine-grained with
-  Contents read/write on this repo only). Used ONLY by the `keepalive`
-  workflow to keep GitHub's 60-day schedule auto-disable from killing the
-  watchdog. Without it the bot still runs - you'd just need to re-enable the
-  workflow manually every 60 days.
+- `PAT_TOKEN` — **required** — a personal access token with access to
+  this repo (classic PAT with `repo` scope, or fine-grained with Contents
+  read/write + Actions read/write on this repo only). This is what keeps
+  the watchdog running 24/7: GitHub refuses chain-dispatches with the
+  built-in token, so the bot uses your PAT to start its own successor run
+  every ~5.5 hours, and the `guard` + `keepalive` workflows use it too.
+  Without it the chain stops after the first ~5.5-hour run.
 
 Leave `SESSION_STRING` for the next step.
 
@@ -234,7 +235,7 @@ The bot only sees what happens while it runs. Compare the options:
 
 | Option | Cost | Reliability | Effort |
 |---|---|---|---|
-| A. GitHub Actions (relay) | Free, no card | ~98-99% (short handover gaps) | Low |
+| A. GitHub Actions (self-chaining) | Free, no card | ~99% (short handover gaps) | Low |
 | B. Your own PC/laptop | Free | Power cuts, reboots | Lowest |
 | C. Cheap Indian VPS | ₹99-500/month | Excellent | Medium |
 | D. Oracle Cloud Always Free | Free forever, needs a card to verify | Good (see caveat) | Highest |
@@ -247,12 +248,15 @@ hours with a weekly quota, giving real daily blind gaps that no trick fixes.
 
 ### Option A — GitHub Actions (free, no card, ~98-99% coverage)
 
-How the relay works: a schedule ticks every 5 minutes; each run checks a
-heartbeat pushed to a `state` branch — if a healthy runner is already
-watching, it exits within seconds; otherwise it restores the encrypted
-database, runs the bot for ~5h48m, and hands over to the next tick. The
-handover gap is ~5-6 minutes every ~6 hours; startup snapshots recover every
-member's current state after each gap.
+How the chain works: there is no cron (they fire late and once caused a
+takeover race that left the bot down). ~30 minutes before GitHub's 6-hour
+job limit, the bot itself dispatches the next run via the API using your
+`PAT_TOKEN`, then exits cleanly; the new run has been QUEUING behind it
+the whole time (GitHub's concurrency group never lets a run cancel the
+watching one), and starts the moment the old one finishes — restores the
+encrypted database and keeps watching. A `guard` workflow checks every
+30 minutes that a watchdog run is alive and resurrects the chain if it
+broke (expired PAT, failed dispatch, manual cancellation).
 
 1. **The repo is already created for you** (public, with the workflow
    `.github/workflows/watchdog.yml`, `sync_state.sh` and
@@ -278,10 +282,9 @@ member's current state after each gap.
    Run. Click the running job and watch the log — you want to see
    `watchdog running`. After ~10 minutes, a `state` branch appears
    (encrypted database + heartbeat).
-5. **Verify the relay:** after ~5h50m the first job ends; the next scheduled
-   run should start within minutes and print `watchdog running` again.
-   The Actions list shows short green runs (skip) plus long green runs
-   (actual watching) — that pattern is healthy.
+5. **Verify the chain:** after ~5h30m the job logs `next run dispatched`,
+   hands over, and the new run starts immediately. The Actions list should
+   show one long green run (~5.5h) after another, no short skip runs.
 6. **Get reports:** easiest via the Actions job log, or pull the DB:
    download `presence.db.enc` from the `state` branch, then on your PC:
    ```

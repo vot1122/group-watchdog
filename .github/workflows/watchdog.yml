@@ -1,16 +1,17 @@
 name: watchdog
 
-# Relay design for the 6-hour job limit:
-#   - scheduled every 5 minutes: if a healthy runner is already watching
-#     (fresh heartbeat on the `state` branch), the run exits immediately
-#   - otherwise it restores the saved database, runs the bot for ~5h48m,
-#     then saves state; the next scheduled run takes over within minutes.
-#   - the Telegram session comes from the SESSION_STRING secret (never a
-#     file in the repo); the database is only ever pushed AES-encrypted.
+# Self-chaining design (replaces the 5-minute cron relay):
+#   - ONE runner at a time, guaranteed by the concurrency group below: a new
+#     run QUEUES behind the current one and is never allowed to cancel it
+#   - ~30 min before the job limit, the bot itself dispatches the NEXT run
+#     with the PAT token (GitHub refuses chain-dispatches via the built-in
+#     GITHUB_TOKEN), then exits cleanly so the final state push happens
+#   - the queued run starts the moment this job finishes, restores the
+#     AES-encrypted database from the `state` branch and takes over
+#   - the guard workflow resurrects the chain if it ever breaks
+#   -> PAT_TOKEN secret is REQUIRED (classic PAT, repo scope, no expiry)
 
 on:
-  schedule:
-    - cron: "*/5 * * * *"
   workflow_dispatch:
     inputs:
       log_level:
@@ -25,7 +26,7 @@ on:
 
 concurrency:
   group: watchdog-runner
-  cancel-in-progress: false
+  cancel-in-progress: false      # NEVER cancel the watching run - queue behind it
 
 permissions:
   contents: write
@@ -50,31 +51,18 @@ jobs:
       SNAPSHOT_EVERY: "30"
       PRUNE_DAYS: "30"
       DB_PASS: ${{ secrets.DB_PASS }}
+      # PAT chain (see bot.py: chain_next_run)
+      PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
+      CHAIN_AFTER_MIN: "330"
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Check heartbeat (is another runner already watching?)
-        run: |
-          git fetch origin state --depth=1 2>/dev/null || true
-          SKIP=false
-          if git cat-file -e origin/state:heartbeat 2>/dev/null; then
-            HB=$(git show origin/state:heartbeat | tr -d '[:space:]')
-            [ -z "$HB" ] && HB=0
-            AGE=$(( $(date +%s) - HB ))
-            echo "Last heartbeat: ${AGE}s ago"
-            if [ "$AGE" -lt 300 ]; then
-              echo "A runner is already active - standing down."
-              SKIP=true
-            fi
-          fi
-          echo "SKIP=$SKIP" >> "$GITHUB_ENV"
-
       - name: Restore saved state
-        if: env.SKIP != 'true'
         run: |
           set -e
+          git fetch origin state --depth=1 2>/dev/null || true
           python -m pip install --quiet telethon
           if git cat-file -e origin/state:presence.db.enc 2>/dev/null; then
             git show origin/state:presence.db.enc > presence.db.enc
@@ -86,12 +74,11 @@ jobs:
             echo "No saved database yet - starting fresh."
           fi
 
-      - name: Run watchdog (~5h48m, then hand over to the next run)
-        if: env.SKIP != 'true'
+      - name: Run watchdog (~5h30m, then hand over to the already-queued next run)
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          bash sync_state.sh &                       # claim the lock immediately
+          bash sync_state.sh &                       # push state right away
           ( while true; do sleep 240; bash sync_state.sh >/dev/null 2>&1 || true; done ) &
           SIDECAR=$!
           CODE=0

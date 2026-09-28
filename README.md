@@ -121,8 +121,9 @@ python report.py --csv users.csv      # flat table for Excel
 This needs an **always-on process** — if it's not running, you miss events.
 
 - **GitHub Actions (free, no card needed)** — see the section below. The bot
-  runs in a relay: each job watches for ~5h48m, saves state, and the next
-  scheduled run takes over within minutes (~98-99% coverage).
+  runs in a **self-chaining** loop: each job watches for ~5h30m, dispatches
+  its own successor with the PAT token, and hands over with no dead time
+  (~99% coverage).
 - **Oracle Cloud Always Free VM** — best fully-continuous free option, but
   signup requires a credit/debit card for verification.
 - A **cheap VPS** (~₹99-500/month).
@@ -133,14 +134,19 @@ This needs an **always-on process** — if it's not running, you miss events.
 ## Running 24/7 on GitHub Actions (free, no card needed)
 
 GitHub Actions kills every job after 6 hours, so the repo ships with a
-**relay** workflow (`.github/workflows/watchdog.yml`):
+**self-chaining** workflow (`.github/workflows/watchdog.yml`):
 
-1. A schedule ticks every 5 minutes. Each run checks a `heartbeat` on the
-   `state` branch — if a healthy runner is already watching, it exits.
-2. Otherwise it restores the saved database, runs the bot for ~5h48m, and
-   stops itself cleanly. The next tick takes over within minutes.
-3. Handover gaps are ~5-6 minutes every ~6 hours; snapshots on startup
-   recover the current state of every member after each gap.
+1. There is **no cron** — crons fire late and a relay race once left the
+   bot down. Instead, ~30 minutes before the job limit the bot itself
+   dispatches the next run via the GitHub API using the `PAT_TOKEN`
+   secret, then exits cleanly.
+2. The new run queues behind the current one (concurrency group with
+   `cancel-in-progress: false`) — **nothing is ever cancelled mid-run**.
+   The moment the old job finishes (after its final state push), the new
+   one starts, restores the encrypted database and takes over.
+3. A `guard` workflow checks every 30 minutes that a watchdog run is alive
+   (running or queued); if the chain ever breaks (expired PAT, failed
+   dispatch, manual cancellation), it starts a fresh run automatically.
 
 **Setup (one time):**
 
@@ -153,7 +159,8 @@ GitHub Actions kills every job after 6 hours, so the repo ships with a
 3. In the repo: Settings → Secrets and variables → Actions → add secrets:
    `API_ID`, `API_HASH`, `SESSION_STRING`, `GROUP` (link/@username/id),
    `DB_PASS` (any long random string — encrypts the database before it is
-   pushed), and optionally `LOG_GROUP`, `NTFY_TOPIC`.
+   pushed), `PAT_TOKEN` (**required** — it chains the runs, see below),
+   and optionally `LOG_GROUP`, `NTFY_TOPIC`.
 4. Actions tab → enable the **watchdog** workflow → run it
    ("Run workflow") once manually. Within a minute it should print
    "watchdog running". The `state` branch appears with the encrypted DB.
@@ -172,9 +179,15 @@ solves this: it runs monthly, pushes an empty commit to `main` and
 re-enables both workflows via the API (which resets the 60-day timer). It
 needs one secret:
 
-- `PAT_TOKEN` — a personal access token that can push to this repo
-  (classic PAT with `repo` scope works; or a fine-grained PAT scoped to
-  this repository with Contents read/write).
+### PAT_TOKEN (required)
+
+`PAT_TOKEN` is what keeps the watchdog alive without cron: GitHub refuses
+workflow-dispatch calls made with the built-in `GITHUB_TOKEN`, so the bot
+uses your personal access token to dispatch the next run of the chain, and
+the `guard` + `keepalive` workflows use it too. Classic PAT with `repo`
+scope (fine-grained with Contents read/write + Actions read/write on this
+repo also works); set a long or no expiry. If it ever expires, the chain
+stops and the guard/keepalive jobs will say so in their logs.
 
 If the workflow ever shows as disabled anyway, open the Actions tab and hit
 "Enable workflow" — you'll also see a "This workflow will be disabled soon"
