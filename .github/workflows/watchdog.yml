@@ -12,6 +12,16 @@ on:
   schedule:
     - cron: "*/5 * * * *"
   workflow_dispatch:
+    inputs:
+      log_level:
+        description: "What to forward to the log group (also changeable live: /level in the log group)"
+        required: false
+        default: "everything"
+        type: choice
+        options:
+          - everything
+          - notable
+          - alerts
 
 concurrency:
   group: watchdog-runner
@@ -32,7 +42,10 @@ jobs:
       LOG_GROUP: ${{ secrets.LOG_GROUP }}
       NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
       NTFY_SERVER: https://ntfy.sh
-      TG_LOG_LEVEL: notable
+      TG_LOG_LEVEL: ${{ github.event.inputs.log_level || 'everything' }}
+      # MANUAL_LEVEL is non-empty only when you picked a level in the
+      # "Run workflow" dropdown - that choice is saved and beats /level.
+      MANUAL_LEVEL: ${{ github.event.inputs.log_level }}
       LOG_MESSAGE_TEXT: "0"
       SNAPSHOT_EVERY: "30"
       PRUNE_DAYS: "30"

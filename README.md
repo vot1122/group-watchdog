@@ -165,6 +165,23 @@ shows the schedule as disabled (GitHub auto-disables schedules after 60 days
 without a commit), open the workflow and re-enable it — the state pushes
 normally keep it alive.
 
+### Controlling the watchdog live, from the log group
+
+The "Run workflow" button offers a log-level dropdown (default: `everything`).
+You can also change it (and more) at runtime by sending commands **in your
+private log group, from the same account** — the bot obeys instantly:
+
+| Command | Effect |
+|---|---|
+| `/level everything` (or `notable` / `alerts`) | change what gets forwarded to the log group; saved in the database, so it survives 6-hour handovers |
+| `/status` | current level, when this run started, how much data is logged |
+| `/report` | generates the full spam-signal report and sends it into the chat as a `watchdog-report.md` file |
+| `/help` | command list |
+
+Levels: `alerts` = floods/always-online/mass-deletions only; `notable` =
+alerts + messages, edits, deletions, joins/leaves, name changes; `everything`
+= all of that plus every online/offline (batched into one message per 5 min).
+
 ## Security notes
 
 - The `.session` file created on first login **is your account**. Never

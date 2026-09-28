@@ -65,6 +65,9 @@ SNAPSHOT_EVERY = int(os.environ.get("SNAPSHOT_EVERY", "30"))  # minutes, 0 = off
 # --- forwarding ---------------------------------------------------------
 LOG_GROUP = os.environ.get("LOG_GROUP", "")      # '' = disabled
 TG_LOG_LEVEL = os.environ.get("TG_LOG_LEVEL", "everything")  # alerts|notable|everything
+# Set (by the workflow) only when you chose a level in the "Run workflow"
+# dropdown - that choice is authoritative and gets persisted to settings.
+MANUAL_LEVEL = os.environ.get("MANUAL_LEVEL", "")
 NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "")     # '' = disabled
 NTFY_SERVER = os.environ.get("NTFY_SERVER", "https://ntfy.sh").rstrip("/")
 NTFY_LEVEL = os.environ.get("NTFY_LEVEL", "alerts")  # alerts|everything
@@ -125,6 +128,11 @@ CREATE TABLE IF NOT EXISTS users (
     display_name   TEXT,
     is_bot         INTEGER DEFAULT 0,
     first_observed REAL
+);
+
+CREATE TABLE IF NOT EXISTS settings (
+    key   TEXT PRIMARY KEY,
+    value TEXT
 );
 """
 
@@ -213,6 +221,20 @@ def prune_old_data():
         "  SELECT user_id FROM presence_events UNION "
         "  SELECT user_id FROM messages UNION "
         "  SELECT user_id FROM group_events WHERE user_id IS NOT NULL)")
+    db.commit()
+
+
+def get_setting(key, default=None):
+    try:
+        row = db.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+        return row[0] if row else default
+    except sqlite3.OperationalError:
+        return default
+
+
+def set_setting(key, value):
+    db.execute("INSERT INTO settings (key, value) VALUES (?,?) "
+               "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
     db.commit()
 
 
@@ -449,6 +471,66 @@ def bind_group_handlers(entity):
         notifier.tg("[%s] %s %s" % (now_str(), name_of(uid) if uid else "?", data), 1)
 
 
+def bind_command_handlers(log_entity):
+    """Live control from the private log group: send these commands there
+    from your account (e.g. typed on your phone) and the bot obeys."""
+
+    @client.on(events.NewMessage(chats=log_entity))
+    async def on_command(event):
+        if event.sender_id != SELF_ID:      # only the owner's own messages
+            return
+        text = (event.raw_text or "").strip()
+        if not text.startswith("/"):
+            return
+        parts = text.lower().split()
+        cmd = parts[0]
+
+        if cmd == "/level" and len(parts) > 1 and parts[1] in LEVELS:
+            notifier.tg_level = LEVELS[parts[1]]
+            set_setting("tg_level", parts[1])
+            await event.reply(
+                "Watchdog log level -> %s\n"
+                "(saved in settings, survives 6h handovers)" % parts[1])
+
+        elif cmd == "/status":
+            cur = {v: k for k, v in LEVELS.items()}.get(notifier.tg_level, "off")
+            try:
+                n_pres = db.execute("SELECT COUNT(*) FROM presence_events").fetchone()[0]
+                n_msg = db.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+                n_ge = db.execute("SELECT COUNT(*) FROM group_events").fetchone()[0]
+                n_users = db.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+            except sqlite3.OperationalError:
+                n_pres = n_msg = n_ge = n_users = 0
+            await event.reply(
+                "Watchdog status\n"
+                "level: %s  (/level alerts|notable|everything)\n"
+                "this run started: %s\n"
+                "members known: %d\n"
+                "logged: %d presence, %d messages, %d group events" % (
+                    cur, get_setting("run_started", "?"),
+                    n_users, n_pres, n_msg, n_ge))
+
+        elif cmd == "/report":
+            import io
+            import report as rep
+            try:
+                text_out, _ = rep.build_report(db)
+                buf = io.BytesIO((text_out + "\n").encode("utf-8"))
+                buf.name = "watchdog-report.md"
+                await client.send_file(
+                    log_entity, buf, caption="Watchdog report")
+            except Exception:
+                log.exception("report command failed")
+                await event.reply("Report failed - check the Actions job log.")
+
+        elif cmd in ("/help", "/start"):
+            await event.reply(
+                "Watchdog commands (send them here, from your account):\n"
+                "/level alerts|notable|everything - what to forward here\n"
+                "/status - what am I doing\n"
+                "/report - full spam-signal report as a file")
+
+
 async def snapshot(entity):
     n = 0
     async for u in client.iter_participants(entity):
@@ -579,6 +661,22 @@ async def main():
 
     log_entity = await resolve_log_group()
     notifier = Notifier(client, log_entity)
+
+    # Log level priority: "Run workflow" dropdown choice > /level command
+    # setting (persisted in the database) > the workflow's default.
+    if MANUAL_LEVEL and MANUAL_LEVEL in LEVELS:
+        set_setting("tg_level", MANUAL_LEVEL)
+    saved_level = get_setting("tg_level")
+    if (saved_level and saved_level in LEVELS and LOG_GROUP
+            and notifier.tg_level >= 0):
+        notifier.tg_level = LEVELS[saved_level]
+        log.info("log level restored from settings: %s", saved_level)
+    set_setting("run_started",
+                datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"))
+    if log_entity is not None:
+        bind_command_handlers(log_entity)
+        log.info("log-group commands enabled: /level /status /report /help")
+
     entity = await resolve_group()
     log.info("watching group: %s", getattr(entity, "title", GROUP))
     log.info("destinations: log-group=%s (level %s), ntfy=%s (level %s)",
