@@ -174,9 +174,20 @@ def record_presence(user_id, online, ts, source="update"):
     if user_id == SELF_ID:      # don't track ourselves (we look online 24/7)
         return
     db.execute(
-        "INSERT INTO presence_events (user_id, ts, online, source) VALUES (?,?,?,?)",
+        "INSERT INTO presence_events (user_id, online, ts, source) VALUES (?,?,?,?)",
         (user_id, online, ts, source))
     db.commit()
+
+
+def cleanup_bad_rows():
+    """Repair for the pre-fix column-swap bug (ts/online were written to
+    each other's columns) and Telegram's 1970 'was_online' garbage. Runs on
+    every start; only malformed rows are touched."""
+    cur = db.execute("DELETE FROM presence_events "
+                     "WHERE ts < 1262304000 OR online NOT IN (0, 1)")
+    db.commit()
+    if cur.rowcount:
+        log.info("removed %d malformed presence rows (pre-fix data)", cur.rowcount)
 
 
 def upsert_user(u, detect_changes=True):
@@ -238,30 +249,72 @@ def set_setting(key, value):
     db.commit()
 
 
+START_TS = time.time()
+QUIET_SECONDS = int(os.environ.get("QUIET_SECONDS", "90"))  # ignore log-group forwarding of the startup status burst
+ONLINE_SINCE = {}
+
+
+def short_dur(sec):
+    sec = int(sec)
+    if sec < 60:
+        return "%ds" % sec
+    if sec < 3600:
+        return "%dm" % sec
+    return "%dh%02dm" % (sec // 3600, (sec % 3600) // 60)
+
+
+def presence_line(uid, is_online):
+    if is_online:
+        ONLINE_SINCE[uid] = time.time()
+        return "%s | %s online" % (now_str(), name_of(uid))
+    started = ONLINE_SINCE.pop(uid, None)
+    if started:
+        return "%s | %s offline (%s)" % (
+            now_str(), name_of(uid), short_dur(time.time() - started))
+    return "%s | %s offline" % (now_str(), name_of(uid))
+
+
 def record_status(user_id, status, source):
     if user_id == SELF_ID:
         return
+    fresh = time.time() - START_TS > QUIET_SECONDS
     if isinstance(status, UserStatusOnline):
         record_presence(user_id, 1, time.time(), source)
-        if notifier:
-            notifier.presence("[%s] %s -> online" % (now_str(), name_of(user_id)))
+        if notifier and fresh:
+            notifier.presence(presence_line(user_id, True))
     elif isinstance(status, UserStatusOffline):
-        ts = status.was_online.timestamp() if status.was_online else time.time()
+        ts = time.time()
+        if status.was_online:
+            try:
+                ts = status.was_online.timestamp()
+            except Exception:
+                pass
+            if ts < 1262304000:   # Telegram sends 1970 for hidden statuses
+                return              # - junk, do not record
+            ts = min(ts, time.time())
         record_presence(user_id, 0, ts, source)
-        if notifier:
-            notifier.presence("[%s] %s -> offline" % (now_str(), name_of(user_id)))
+        if notifier and fresh:
+            notifier.presence(presence_line(user_id, False))
     # UserStatusRecently / LastWeek / LastMonth: hidden by privacy, untrackable.
 
 
 # -------------------------------------------------------------- forwarding --
 
 class Notifier:
-    """Forwards log lines to the Telegram log group and ntfy.
+    """Log-group output WITHOUT spam:
 
-    Levels: 0 = alerts, 1 = notable, 2 = presence (everything).
-    Batching is intentional: sending one message per event would hit
-    Telegram flood limits in an active group.
+    - ONE rolling log message, edited in place; a new message is sent only
+      after the current one passes 100 lines / ~3500 chars
+    - ONE live-report message, re-edited every 10 minutes
+    - alerts (floods, mass deletions, always-online) still get their own
+      messages - they are rare and important
+    - ntfy push for alerts, as before
+
+    Levels: 0 = alerts, 1 = notable, 2 = everything (presence included).
     """
+
+    MAX_LINES = 100
+    MAX_CHARS = 3500
 
     def __init__(self, client, log_entity=None):
         self.client = client
@@ -270,25 +323,51 @@ class Notifier:
         if LOG_GROUP and log_entity is None:
             self.tg_level = -1  # unresolved log group - disable forwarding
         self.ntfy_level = LEVELS.get(NTFY_LEVEL, 0) if NTFY_TOPIC else -1
-        self.pending = []        # alerts + notable
-        self.presence_buf = []   # presence lines (batched slowly)
-        self.ntfy_buf = []       # notable lines for ntfy (only if everything)
+        self.buffer = []
+        self.log_lines = []      # content of the current rolling message
+        self.log_msg_id = None
+        self.report_msg_id = None
+        self.ntfy_buf = []
+
+    async def restore(self):
+        """Continue editing the previous run's rolling / report messages
+        (message ids persist in the database across handovers)."""
+        if self.tg_level < 0:
+            return
+        for key, attr in (("log_msg_id", "log_msg_id"),
+                          ("report_msg_id", "report_msg_id")):
+            mid = int(get_setting(key, "0") or 0)
+            if mid:
+                setattr(self, attr, mid)
+        if self.log_msg_id:
+            try:
+                msg = await self.client.get_messages(self.log_entity,
+                                                     ids=self.log_msg_id)
+                if msg:
+                    self.log_lines = (msg.text or "").splitlines()[-self.MAX_LINES:]
+            except Exception:
+                self.log_msg_id = None
+                self.log_lines = []
 
     # -- queueing ----------------------------------------------------------
     def tg(self, line, level=1):
         if self.tg_level < 0 or level > self.tg_level:
             return
-        self.pending.append(line)
+        self.buffer.append(line)
         if level == 1 and self.ntfy_level >= 2:
             self.ntfy_buf.append(line)
 
     def presence(self, line):
-        if self.tg_level < 2:
-            return
-        self.presence_buf.append(line)
+        self.tg(line, 2)
 
     async def alert(self, title, body):
-        self.tg("ALERT %s | %s" % (title, body), 0)
+        if self.tg_level >= 0:
+            try:
+                await self.client.send_message(
+                    self.log_entity, "ALERT %s | %s" % (title, body),
+                    parse_mode=None)
+            except Exception:
+                log.exception("alert send failed")
         if self.ntfy_level >= 0:
             await self._ntfy_post(title, body, priority="high")
 
@@ -306,23 +385,61 @@ class Notifier:
         except Exception as e:
             log.warning("ntfy failed: %s", e)
 
-    async def _flush_loop(self, buf, interval):
+    async def _rolling_loop(self):
         while True:
-            await asyncio.sleep(interval)
-            if not buf:
+            await asyncio.sleep(60)
+            if not self.buffer:
                 continue
-            lines = buf[:]
-            buf.clear()
+            new = self.buffer[:]
+            self.buffer.clear()
             try:
-                text = "\n".join(lines)
-                for i in range(0, len(text), 4000):
-                    await self.client.send_message(self.log_entity, text[i:i + 4000])
+                merged = self.log_lines + new
+                if (self.log_msg_id is None
+                        or len(merged) > self.MAX_LINES
+                        or len("\n".join(merged)) > self.MAX_CHARS):
+                    # previous message full (or none yet): send a new one
+                    msg = await self.client.send_message(
+                        self.log_entity, "\n".join(new), parse_mode=None)
+                    self.log_msg_id = msg.id
+                    self.log_lines = new[-self.MAX_LINES:]
+                    set_setting("log_msg_id", str(msg.id))
+                else:
+                    self.log_lines = merged
+                    await self.client.edit_message(
+                        self.log_entity, self.log_msg_id,
+                        "\n".join(self.log_lines), parse_mode=None)
             except FloodWaitError as e:
-                log.warning("flood-wait %ss - requeueing log batch", e.seconds)
-                buf[:0] = lines
+                log.warning("flood-wait %ss - requeueing", e.seconds)
+                self.buffer[:0] = new
                 await asyncio.sleep(min(e.seconds + 5, 300))
             except Exception:
-                log.exception("log-group send failed - dropping batch")
+                log.exception("rolling log update failed")
+                self.buffer[:0] = new
+                self.log_msg_id = None   # start a fresh message next cycle
+                self.log_lines = []
+
+    async def _report_loop(self):
+        first = True
+        while True:
+            await asyncio.sleep(30 if first else 600)
+            first = False
+            if self.tg_level < 0:
+                continue
+            try:
+                import report as rep
+                text = rep.compact_report(db)
+                if self.report_msg_id:
+                    await self.client.edit_message(
+                        self.log_entity, self.report_msg_id, text,
+                        parse_mode=None)
+                else:
+                    msg = await self.client.send_message(
+                        self.log_entity, text, parse_mode=None)
+                    self.report_msg_id = msg.id
+                    set_setting("report_msg_id", str(msg.id))
+            except Exception:
+                log.exception("live report update failed")
+                self.report_msg_id = None
 
     async def _ntfy_loop(self):
         # only used for NTFY_LEVEL=everything: batched notable lines
@@ -337,8 +454,8 @@ class Notifier:
 
     def start(self):
         if self.tg_level >= 0:
-            client.loop.create_task(self._flush_loop(self.pending, 10))
-            client.loop.create_task(self._flush_loop(self.presence_buf, 300))
+            client.loop.create_task(self._rolling_loop())
+            client.loop.create_task(self._report_loop())
         if self.ntfy_level >= 0:
             client.loop.create_task(self._ntfy_loop())
 
@@ -541,7 +658,7 @@ async def snapshot(entity):
 
 
 async def presence_alerts():
-    """Every 15 min: alert about users online continuously for too long."""
+    """Every 15 min: ONE aggregated alert about users online too long."""
     alerted = {}
     while True:
         await asyncio.sleep(900)
@@ -552,14 +669,20 @@ async def presence_alerts():
                 "            WHERE user_id = pe.user_id ORDER BY ts DESC LIMIT 1)"
             ).fetchall()
             now = time.time()
+            hits = []
             for uid, ts, online in rows:
-                if online and now - ts >= ONLINE_ALERT_HOURS * 3600:
+                if online == 1 and now - ts >= ONLINE_ALERT_HOURS * 3600:
                     if now - alerted.get(uid, 0) > 48 * 3600:
                         alerted[uid] = now
-                        await notifier.alert(
-                            "Always-online user",
-                            "%s has been online for %.1f hours straight" % (
-                                name_of(uid), (now - ts) / 3600))
+                        hits.append((uid, (now - ts) / 3600))
+            if hits:
+                body = ["%d user(s) online for %d+ hours straight:" % (
+                    len(hits), ONLINE_ALERT_HOURS)]
+                for uid, hours in hits[:10]:
+                    body.append("- %s (%.1f h)" % (name_of(uid), hours))
+                if len(hits) > 10:
+                    body.append("- ... and %d more" % (len(hits) - 10))
+                await notifier.alert("Always-online users", "\n".join(body))
         except Exception:
             log.exception("presence alert check failed")
 
@@ -660,7 +783,9 @@ async def main():
     log.info("logged in as %s", me.first_name)
 
     log_entity = await resolve_log_group()
+    cleanup_bad_rows()
     notifier = Notifier(client, log_entity)
+    await notifier.restore()
 
     # Log level priority: "Run workflow" dropdown choice > /level command
     # setting (persisted in the database) > the workflow's default.

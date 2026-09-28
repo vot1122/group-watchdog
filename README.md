@@ -193,9 +193,19 @@ private log group, from the same account** — the bot obeys instantly:
 | `/report` | generates the full spam-signal report and sends it into the chat as a `watchdog-report.md` file |
 | `/help` | command list |
 
-Levels: `alerts` = floods/always-online/mass-deletions only; `notable` =
-alerts + messages, edits, deletions, joins/leaves, name changes; `everything`
-= all of that plus every online/offline (batched into one message per 5 min).
+Levels: `alerts` = alert messages only; `notable` = alerts + messages,
+edits, deletions, joins/leaves, name changes; `everything` = all of that
+plus online/offline lines like `14:02 | abjj online` /
+`14:37 | abjj offline (35m)`.
+
+**Anti-spam output design**: events go to ONE rolling log message that is
+edited in place — a new message is sent only after it passes 100 lines
+(~3500 chars), exactly as requested. A separate LIVE REPORT message is
+re-edited every 10 minutes with the current top suspects, counts and top
+talkers, so the report is always up to date without any new messages.
+Alerts (floods, mass deletions, always-online) still arrive as their own
+messages since they are rare. Message ids persist in the database, so the
+rolling log and live report survive 6-hour handovers.
 
 ## Security notes
 

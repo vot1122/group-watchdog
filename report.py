@@ -86,6 +86,7 @@ def compute(uid, rows):
         "active_h": len({datetime.fromtimestamp(a, tz=timezone.utc).hour
                          for a, _ in sessions}),
         "online_events": sum(1 for _, on in tr if on),
+        "first_online": tr[0][1] == 1,   # was already online when we started
     }
     m["uptime_ratio"] = (m["uptime"] / (window_end - first)) if window_end > first else None
     return m
@@ -365,6 +366,9 @@ def build_report(db):
         a("")
         a("- observed: %s -> %s (%.1f hours)" % (
             fmt_ts(m["first"]), fmt_ts(m["last"]), m["window_h"]))
+        if m.get("first_online"):
+            a("- note: was already online when monitoring began - uptime is "
+              "counted from when we first saw them")
         a("- total uptime: %s across %d sessions" % (human(m["uptime"]), m["n_sessions"]))
         a("- total offline time (observed): %s" % human(m["offline"]))
         if m["uptime_ratio"] is not None:
@@ -381,6 +385,62 @@ def build_report(db):
     a("- Scores are heuristics, not proof. Always combine with manual review "
       "(message content, account age, join date) before acting.")
     return "\n".join(lines), results
+
+
+def compact_report(db, limit=8):
+    """Short live summary shown in the log group's LIVE REPORT message."""
+    users = {r[0]: {"username": r[1], "display_name": r[2]}
+             for r in db.execute(
+                 "SELECT user_id, username, display_name, is_bot FROM users")}
+    events = {}
+    for uid, ts, online in db.execute(
+            "SELECT user_id, ts, online FROM presence_events ORDER BY ts"):
+        events.setdefault(uid, []).append((ts, online))
+    msg = message_stats(db)
+    churn, _ = churn_stats(db)
+    results = []
+    for uid, rows in events.items():
+        m = compute(uid, rows)
+        m["msg"] = msg.get(uid)
+        m["churn"] = churn.get(uid, 0)
+        s, reasons = score(m, m["msg"], m["churn"])
+        m["score"], m["reasons"] = s, reasons
+        results.append(m)
+    results.sort(key=lambda x: -x["score"])
+
+    def uname(uid):
+        u = users.get(uid, {})
+        return u.get("username") or uid
+
+    lines = ["LIVE REPORT - updated %s UTC" %
+             datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M"), ""]
+
+    shown = [m for m in results if m["score"] > 0][:limit]
+    if shown:
+        lines.append("Top suspects:")
+        for i, m in enumerate(shown, 1):
+            lines.append("%d. %s - %d/100 %s - %s" % (
+                i, uname(m["user_id"]), m["score"], label(m["score"]),
+                (m["reasons"][0] if m["reasons"] else "")[:70]))
+    else:
+        lines.append("No automation signals yet (needs ~a day of data).")
+    lines.append("")
+    try:
+        n_msgs = db.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+        n_del = db.execute(
+            "SELECT COUNT(*) FROM messages WHERE deleted=1").fetchone()[0]
+    except sqlite3.OperationalError:
+        n_msgs = n_del = 0
+    n_ev = sum(len(v) for v in events.values())
+    lines.append("members: %d | presence events: %d | messages: %d (%d deleted)"
+                 % (len(users), n_ev, n_msgs, n_del))
+    talkers = sorted(((m["msg"]["sent"], m) for m in results if m["msg"]),
+                      key=lambda x: -x[0])[:5]
+    if talkers:
+        lines.append("")
+        lines.append("Top talkers: " + ", ".join(
+            "%s (%d)" % (uname(m["user_id"]), sent) for sent, m in talkers))
+    return "\n".join(lines)[:3800]
 
 
 def export_csv(results, path, users):
