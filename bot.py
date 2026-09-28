@@ -337,6 +337,8 @@ def short_dur(sec):
     sec = int(sec)
     if sec < 60:
         return "%ds" % sec
+    if sec < 300:             # fresh sessions tick with second precision
+        return "%dm%02ds" % (sec // 60, sec % 60)
     if sec < 3600:
         return "%dm" % (sec // 60)
     return "%dh%02dm" % (sec // 3600, (sec % 3600) // 60)
@@ -553,15 +555,22 @@ class UserBoards:
     cycle to stay far below Telegram flood limits. Telegram refuses edits
     after ~48h, so a stale board automatically rolls over into a fresh
     message.
+
+    LIVE TICKER: every cycle, each currently-online member's board is
+    refreshed so the "online 14:29 (2m14s)" head line visibly ticks
+    forward. A local last-text cache means a Telegram edit only happens
+    when the displayed text actually changed - fresh sessions tick every
+    cycle, settled ones (~1 edit/min), and identical text costs nothing.
     """
 
-    MAX_EDITS_PER_CYCLE = 10   # + 0.5s pause between edits -> ~1 edit/sec max
+    MAX_EDITS_PER_CYCLE = 8    # + 0.5s pause between edits -> ~1 edit/sec max
 
     def __init__(self, client, log_entity):
         self.client = client
         self.log_entity = log_entity
-        self.msg_ids = {}   # uid -> message id
-        self.dirty = set()
+        self.msg_ids = {}    # uid -> message id
+        self.dirty = {}      # uid -> None (ordered set: FIFO queue)
+        self.last_text = {}  # uid -> last text actually on Telegram
 
     def enabled(self):
         return (self.log_entity is not None
@@ -569,7 +578,7 @@ class UserBoards:
 
     def touch(self, uid):
         if self.enabled():
-            self.dirty.add(uid)
+            self.dirty[uid] = None
 
     def backfill(self):
         """Queue a board for EVERY member we hold presence data for.
@@ -585,7 +594,7 @@ class UserBoards:
             if uid == SELF_ID:
                 continue
             if self.enabled():
-                self.dirty.add(uid)
+                self.dirty[uid] = None
                 n += 1
         return n
 
@@ -659,34 +668,56 @@ class UserBoards:
     async def run(self):
         while True:
             await asyncio.sleep(BOARD_EVERY)
-            if not self.dirty or not self.enabled():
+            if not self.enabled():
                 continue
-            for uid in list(self.dirty)[:self.MAX_EDITS_PER_CYCLE]:
-                self.dirty.discard(uid)
+
+            # live ticker: everyone currently online gets re-queued so their
+            # head line ticks forward ("online 14:29 (2m14s)"); the text
+            # cache below means no Telegram edit unless the text changed
+            tickers = [uid for uid, st in LAST_STATE.items()
+                       if st and st[1] == 1]
+
+            # transitions first (they matter most), tickers fill the rest
+            # of this cycle's budget
+            batch = list(self.dirty)[:self.MAX_EDITS_PER_CYCLE]
+            for uid in batch:
+                del self.dirty[uid]
+            for uid in tickers:
+                if len(batch) >= self.MAX_EDITS_PER_CYCLE:
+                    break
+                if uid not in batch:
+                    batch.append(uid)
+
+            for uid in batch:
                 try:
                     text = self.build_text(uid)
+                    if self.last_text.get(uid) == text:
+                        continue       # nothing visible changed - no API call
                     mid = self.msg_ids.get(uid)
                     if mid:
                         try:
                             await self.client.edit_message(
                                 self.log_entity, mid, text, parse_mode=None)
+                            self.last_text[uid] = text
                             continue
                         except MessageNotModifiedError:
+                            self.last_text[uid] = text
                             continue
                         except FloodWaitError as e:
                             log.warning("board edit flood-wait %ss", e.seconds)
                             await asyncio.sleep(min(e.seconds + 5, 120))
-                            self.dirty.add(uid)
+                            self.dirty[uid] = None
                             continue
                         except Exception:
                             pass    # too old / deleted -> roll over to a new one
                     msg = await self.client.send_message(
                         self.log_entity, text, parse_mode=None)
                     self.msg_ids[uid] = msg.id
+                    self.last_text[uid] = text
                     set_setting("uboard:%d" % uid, str(msg.id))
                 except Exception:
                     log.exception("board update failed for %s", uid)
-                    self.dirty.add(uid)
+                    self.dirty[uid] = None
                 await asyncio.sleep(0.5)   # stay well under Telegram edit limits
 
 

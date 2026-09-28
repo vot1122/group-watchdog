@@ -218,7 +218,10 @@ plus a per-member online/offline **board message** (see below).
 **Anti-spam output design**: every member gets their **own board message**
 that is edited in place each time they come online / go offline — showing
 their recent sessions and a running total uptime that always sits at the
-bottom:
+bottom. While a member is **online**, the head line also ticks live:
+`online 17:30 (2m14s)` visibly counts up every few seconds (a local text
+cache means Telegram edits only happen when the displayed text actually
+changed, so settled sessions cost ~1 edit/min and nothing ever floods):
 
 ```
 @abc - online 17:30 (34m)
