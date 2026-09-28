@@ -1,0 +1,46 @@
+name: keepalive
+
+# Why this exists: GitHub auto-disables SCHEDULED workflows in public repos
+# after 60 days without repository activity - and the activity that counts is
+# commits on the DEFAULT branch. The watchdog's state commits go to the
+# `state` branch, so they may not count. This workflow runs monthly and:
+#   1. pushes an empty keepalive commit to main (with your PAT), and
+#   2. re-enables both workflows via the API (which resets the 60-day timer)
+#
+# Requires the secret PAT_TOKEN (a personal access token with access to this
+# repo). Without it, this workflow just prints a warning.
+
+on:
+  schedule:
+    - cron: "23 4 1 * *"   # 1st of every month, 04:23 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Keepalive commit + workflow re-enable
+        env:
+          PAT: ${{ secrets.PAT_TOKEN }}
+        run: |
+          if [ -z "$PAT" ]; then
+            echo "::warning::PAT_TOKEN secret is not set - schedules may be disabled after 60 days. Add it in Settings > Secrets and variables > Actions."
+            exit 0
+          fi
+          git config user.name "keepalive-bot"
+          git config user.email "keepalive-bot@users.noreply.github.com"
+          git remote set-url origin "https://x-access-token:${PAT}@github.com/${GITHUB_REPOSITORY}.git"
+          git commit --allow-empty -q -m "keepalive $(date -u +%Y-%m-%d)"
+          git push -q origin HEAD:main
+          echo "keepalive commit pushed to main"
+          for wf in watchdog keepalive; do
+            curl -s -X PUT -H "Authorization: Bearer $PAT" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/${wf}.yml/enable" \
+              && echo " (enabled ${wf})" || echo "could not re-enable ${wf} - the commit above is what matters"
+          done

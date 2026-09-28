@@ -41,6 +41,12 @@ variables → Actions → "New repository secret". Add, one by one:
 - `DB_PASS` — any long random string you invent
 - `GROUP` — your group's link / @username / -100... id
 - (optional) `LOG_GROUP`, `NTFY_TOPIC`
+- (optional but recommended) `PAT_TOKEN` — a personal access token with
+  access to this repo (classic PAT with `repo` scope, or fine-grained with
+  Contents read/write on this repo only). Used ONLY by the `keepalive`
+  workflow to keep GitHub's 60-day schedule auto-disable from killing the
+  watchdog. Without it the bot still runs - you'd just need to re-enable the
+  workflow manually every 60 days.
 
 Leave `SESSION_STRING` for the next step.
 

@@ -160,10 +160,25 @@ GitHub Actions kills every job after 6 hours, so the repo ships with a
 
 Security model: the repo only ever contains code; your session lives in an
 encrypted GitHub secret; the database is pushed only as an AES-256-encrypted
-gzip blob (`sync_state.sh`), never in plaintext. If the Actions tab ever
-shows the schedule as disabled (GitHub auto-disables schedules after 60 days
-without a commit), open the workflow and re-enable it — the state pushes
-normally keep it alive.
+gzip blob (`sync_state.sh`), never in plaintext.
+
+### Keeping the schedule alive past 60 days
+
+GitHub auto-disables **scheduled** workflows in public repos after 60 days
+without repository activity, and what counts is commits on the default
+branch — the watchdog's state commits go to the `state` branch, so don't
+rely on them. The `keepalive` workflow (`.github/workflows/keepalive.yml`)
+solves this: it runs monthly, pushes an empty commit to `main` and
+re-enables both workflows via the API (which resets the 60-day timer). It
+needs one secret:
+
+- `PAT_TOKEN` — a personal access token that can push to this repo
+  (classic PAT with `repo` scope works; or a fine-grained PAT scoped to
+  this repository with Contents read/write).
+
+If the workflow ever shows as disabled anyway, open the Actions tab and hit
+"Enable workflow" — you'll also see a "This workflow will be disabled soon"
+banner as a warning.
 
 ### Controlling the watchdog live, from the log group
 
