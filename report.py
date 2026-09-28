@@ -14,10 +14,12 @@ Usage:
 
 import argparse
 import csv
+import os
 import sqlite3
 import statistics
 import time
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 
 def human(sec):
@@ -31,8 +33,40 @@ def human(sec):
     return "%dh%02dm" % (sec // 3600, (sec % 3600) // 60)
 
 
+def _tz_list(db=None):
+    """Active display zones: the /tz setting (if a db is given) > the
+    TIMEZONES env var > Asia/Kolkata,UTC."""
+    spec = None
+    if db is not None:
+        try:
+            row = db.execute(
+                "SELECT value FROM settings WHERE key='timezones'").fetchone()
+            if row:
+                spec = row[0]
+        except sqlite3.OperationalError:
+            pass
+    spec = spec or os.environ.get("TIMEZONES", "Asia/Kolkata,UTC")
+    objs = []
+    for name in spec.split(","):
+        try:
+            objs.append(ZoneInfo(name.strip()))
+        except Exception:
+            pass
+    return objs or [timezone.utc]
+
+
+def fmt_tz(ts, tzs, with_date=False):
+    """One timestamp rendered in every zone: '14:30 IST · 09:00 UTC'."""
+    f = "%d %b %H:%M" if with_date else "%H:%M"
+    return " · ".join(
+        "%s %s" % (
+            datetime.fromtimestamp(ts, tz=tz).strftime(f),
+            datetime.fromtimestamp(ts, tz=tz).tzname() or str(tz))
+        for tz in tzs)
+
+
 def fmt_ts(ts):
-    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    return fmt_tz(ts, _tz_list(), with_date=True)
 
 
 # ------------------------------------------------------------- computation --
@@ -222,7 +256,7 @@ def build_report(db):
 
     a("# Group watchdog report")
     a("")
-    a("Generated %s (all times UTC)" % fmt_ts(time.time()))
+    a("Generated %s" % fmt_ts(time.time()))
     a("")
 
     # ============================ SECTION A ================================
@@ -432,8 +466,8 @@ def compact_report(db, limit=6):
         d = now.timestamp() - first
         watching = " · watching %dd%02dh" % (d // 86400, (d % 86400) // 3600)
 
-    lines = ["\U0001F4CA LIVE REPORT · %s UTC%s" % (
-        now.strftime("%d %b %H:%M"), watching)]
+    lines = ["\U0001F4CA LIVE REPORT · %s%s" % (
+        fmt_tz(now.timestamp(), _tz_list(db), with_date=True), watching)]
 
     shown = [m for m in results if m["score"] > 0][:limit]
     if shown:

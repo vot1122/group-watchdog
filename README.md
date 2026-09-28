@@ -202,6 +202,7 @@ private log group, from the same account** — the bot obeys instantly:
 | Command | Effect |
 |---|---|
 | `/level everything` (or `notable` / `alerts`) | change what gets forwarded to the log group; saved in the database, so it survives 6-hour handovers |
+| `/tz Asia/Kolkata,UTC` | set which timezones every timestamp is shown in (multiple at once, e.g. `12:49 IST · 06:49 UTC`); any IANA names work; saved in the database |
 | `/status` | current level, when this run started, how much data is logged |
 | `/report` | generates the full spam-signal report and sends it into the chat as a `watchdog-report.md` file |
 | `/help` | command list |

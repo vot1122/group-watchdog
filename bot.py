@@ -25,6 +25,7 @@ import time
 import urllib.request
 from collections import deque
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 from telethon import TelegramClient, events
 from telethon.errors import FloodWaitError, MessageNotModifiedError
@@ -168,7 +169,43 @@ def now_str():
 
 
 def now_min():
-    return datetime.now(timezone.utc).strftime("%H:%M")
+    return fmt_tz(time.time())
+
+
+DEFAULT_TZS = "Asia/Kolkata,UTC"
+
+
+def parse_tz(spec):
+    """'Asia/Kolkata,UTC' -> (['Asia/Kolkata', 'UTC'], [ZoneInfo, ...]).
+    Invalid entries are dropped; falls back to UTC if none survive."""
+    names, objs = [], []
+    for name in (spec or "").split(","):
+        name = name.strip()
+        if not name:
+            continue
+        try:
+            objs.append(ZoneInfo(name))
+            names.append(name)
+        except Exception:
+            log.warning("ignoring invalid timezone %r", name)
+    if not objs:
+        names, objs = ["UTC"], [timezone.utc]
+    return names, objs
+
+
+def fmt_tz(ts, with_date=False):
+    """One timestamp rendered in every configured zone, e.g.
+    '14:30 IST · 09:00 UTC' (dates included when with_date=True).
+    Set the zones via the TIMEZONES env var or live with /tz."""
+    f = "%d %b %H:%M" if with_date else "%H:%M"
+    out = []
+    for tz in TZ_LIST:
+        dt = datetime.fromtimestamp(ts, tz=tz)
+        out.append("%s %s" % (dt.strftime(f), dt.tzname() or str(tz)))
+    return " · ".join(out)
+
+
+TZ_SPECS, TZ_LIST = parse_tz(os.environ.get("TIMEZONES", DEFAULT_TZS))
 
 
 def name_of(uid):
@@ -568,16 +605,14 @@ class UserBoards:
         if cur_on:
             total += now - cur_on
         n_sessions = len(sessions) + (1 if cur_on else 0)
-        d = lambda t: datetime.fromtimestamp(t, tz=timezone.utc)
 
         if cur_on:
             head = "%s - online %s (%s)" % (
-                name_of(uid), d(cur_on).strftime("%H:%M"), short_dur(now - cur_on))
+                name_of(uid), fmt_tz(cur_on), short_dur(now - cur_on))
         elif last_off:
-            ago = now - last_off
             head = "%s - last seen %s" % (
                 name_of(uid),
-                d(last_off).strftime("%H:%M" if ago < 86400 else "%d %b %H:%M"))
+                fmt_tz(last_off, with_date=(now - last_off) >= 86400))
         else:
             head = name_of(uid)
 
@@ -586,17 +621,17 @@ class UserBoards:
         if shown:
             lines.append("")
             for a, b in shown[::-1]:
-                fa, fb = d(a), d(b)
-                same = fa.date() == fb.date()
-                lines.append("%s→%s (%s)" % (
-                    fa.strftime("%H:%M" if same else "%d %H:%M"),
-                    fb.strftime("%H:%M"), short_dur(b - a)))
+                old = (now - a) >= 86400
+                lines.append("%s → %s (%s)" % (
+                    fmt_tz(a, with_date=old), fmt_tz(b, with_date=old),
+                    short_dur(b - a)))
             if len(sessions) > BOARD_HISTORY:
                 lines.append("(+%d older)" % (len(sessions) - BOARD_HISTORY))
         lines.append("")
         lines.append("uptime %s - %d sessions%s" % (
             short_dur(total), n_sessions,
-            (" - since %s" % d(first_ts).strftime("%d %b")) if first_ts else ""))
+            (" - since %s" % datetime.fromtimestamp(
+                first_ts, tz=TZ_LIST[0]).strftime("%d %b")) if first_ts else ""))
         return "\n".join(lines)
 
     async def run(self):
@@ -777,15 +812,15 @@ def bind_command_handlers(log_entity):
         text = (event.raw_text or "").strip()
         if not text.startswith("/"):
             return
-        parts = text.lower().split()
-        cmd = parts[0]
+        parts = text.split()          # keep case: IANA zones are case-sensitive
+        cmd = parts[0].lower()
 
-        if cmd == "/level" and len(parts) > 1 and parts[1] in LEVELS:
-            notifier.tg_level = LEVELS[parts[1]]
-            set_setting("tg_level", parts[1])
+        if cmd == "/level" and len(parts) > 1 and parts[1].lower() in LEVELS:
+            notifier.tg_level = LEVELS[parts[1].lower()]
+            set_setting("tg_level", parts[1].lower())
             await event.reply(
                 "Watchdog log level -> %s\n"
-                "(saved in settings, survives 6h handovers)" % parts[1])
+                "(saved in settings, survives 6h handovers)" % parts[1].lower())
 
         elif cmd == "/status":
             cur = {v: k for k, v in LEVELS.items()}.get(notifier.tg_level, "off")
@@ -819,10 +854,34 @@ def bind_command_handlers(log_entity):
                 log.exception("report command failed")
                 await event.reply("Report failed - check the Actions job log.")
 
+        elif cmd == "/tz":
+            global TZ_SPECS, TZ_LIST
+            spec = " ".join(parts[1:]).replace(" ", "")
+            if not spec:
+                await event.reply(
+                    "Timestamps are shown in: %s\n"
+                    "Change with: /tz Asia/Kolkata,UTC\n"
+                    "(any IANA names, e.g. Asia/Yerevan, Europe/London, America/New_York)"
+                    % ", ".join(TZ_SPECS))
+            else:
+                names, objs = parse_tz(spec)
+                if names == ["UTC"] and "UTC" not in spec.upper():
+                    await event.reply(
+                        "No valid timezone in %r - use IANA names like "
+                        "Asia/Kolkata, UTC, Asia/Yerevan" % spec)
+                else:
+                    TZ_SPECS, TZ_LIST = names, objs
+                    set_setting("timezones", ",".join(names))
+                    await event.reply(
+                        "Timestamps now shown in: %s\nExample: %s\n"
+                        "(saved in settings, survives handovers)"
+                        % (", ".join(names), fmt_tz(time.time())))
+
         elif cmd in ("/help", "/start"):
             await event.reply(
                 "Watchdog commands (send them here, from your account):\n"
                 "/level alerts|notable|everything - what to forward here\n"
+                "/tz Asia/Kolkata,UTC - timezones shown on every timestamp\n"
                 "/status - what am I doing\n"
                 "/report - full spam-signal report as a file")
 
@@ -1022,6 +1081,12 @@ async def main():
             and notifier.tg_level >= 0):
         notifier.tg_level = LEVELS[saved_level]
         log.info("log level restored from settings: %s", saved_level)
+    global TZ_SPECS, TZ_LIST
+    saved_tz = get_setting("timezones")
+    if saved_tz:
+        TZ_SPECS, TZ_LIST = parse_tz(saved_tz)
+        log.info("timezones restored from settings: %s", ", ".join(TZ_SPECS))
+    log.info("timestamps shown in: %s", ", ".join(TZ_SPECS))
     set_setting("run_started",
                 datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"))
     if log_entity is not None:
