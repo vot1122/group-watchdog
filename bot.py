@@ -574,8 +574,10 @@ class UserBoards:
             head = "%s - online %s (%s)" % (
                 name_of(uid), d(cur_on).strftime("%H:%M"), short_dur(now - cur_on))
         elif last_off:
+            ago = now - last_off
             head = "%s - last seen %s" % (
-                name_of(uid), d(last_off).strftime("%H:%M"))
+                name_of(uid),
+                d(last_off).strftime("%H:%M" if ago < 86400 else "%d %b %H:%M"))
         else:
             head = name_of(uid)
 
@@ -1001,6 +1003,11 @@ async def main():
 
     log_entity = await resolve_log_group()
     cleanup_bad_rows()
+    # when monitoring actually began (settings survive handovers) - used by
+    # the dashboard instead of the oldest event, because Telegram backfills
+    # members' real last-seen timestamps (which can be months old)
+    if not get_setting("monitor_since"):
+        set_setting("monitor_since", str(int(time.time())))
     notifier = Notifier(client, log_entity)
     await notifier.restore()
     boards = UserBoards(client, log_entity)

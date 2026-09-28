@@ -414,7 +414,19 @@ def compact_report(db, limit=6):
         return u.get("username") or uid
 
     now = datetime.now(timezone.utc)
-    first = min((rows[0][0] for rows in events.values()), default=None)
+    # "watching" = when monitoring actually began (persisted by bot.py as a
+    # setting), NOT the oldest event - Telegram backfills real last-seen
+    # timestamps that can be months in the past.
+    first = None
+    try:
+        row = db.execute(
+            "SELECT value FROM settings WHERE key='monitor_since'").fetchone()
+        if row:
+            first = float(row[0])
+    except (sqlite3.OperationalError, TypeError, ValueError):
+        pass
+    if first is None:
+        first = min((rows[0][0] for rows in events.values()), default=None)
     watching = ""
     if first:
         d = now.timestamp() - first
