@@ -64,15 +64,31 @@ Scores are heuristics only — the final judgment stays with the moderator.
 GitHub Actions runner (ubuntu-latest, ~5h30m per run)
  └─ bot.py (Telethon, StringSession)
      ├─ events → SQLite (WAL mode, 30-day pruning)
-     ├─ per-user board messages ─┐
-     ├─ one rolling log message  ├─ edited in place, in a private log group
-     ├─ one LIVE REPORT dashboard ┘
+     ├─ per-user board messages ─┐   (one per member, backfilled on start
+     ├─ one rolling log message  ├─  so nobody is invisible; edited in
+     ├─ one LIVE REPORT dashboard ┘   place, timestamps multi-timezone)
      └─ alerts (flood / mass-delete / always-online) → own messages + ntfy push
  state: encrypted DB pushed to the `state` branch every ~32 min + on exit
  handover: bot dispatches its successor with PAT → exits → successor
  restores the encrypted DB and continues (message ids persist in the DB,
  so boards/logs/dashboard survive handovers)
 ```
+
+### Feature highlights
+
+- **Per-member board messages**: full online/offline session history and a
+  running total uptime per member, edited in place; regenerated from the
+  database so they self-heal across handovers; rolled over automatically
+  when Telegram's ~48h edit limit hits.
+- **Multi-timezone timestamps**: every stamp renders in all configured
+  zones at once (default `13:49 IST · 08:19 UTC`), changeable live via
+  `/tz Asia/Kolkata,UTC` (any IANA names) without restarting.
+- **Live control**: `/level`, `/tz`, `/status`, `/report`, `/help` sent from
+  the moderator's own account in the log group; all settings survive
+  handovers.
+- **Spam signals** (see `report.py`): 24/7 uptime, machine-regular offline
+  gaps, no-sleep active hours, micro-sessions, message floods, delete
+  ratios, join/leave churn — each with a 0–100 score and reasons.
 
 ## What we would like reviewed (please be harsh)
 

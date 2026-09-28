@@ -569,6 +569,24 @@ class UserBoards:
         if self.enabled():
             self.dirty.add(uid)
 
+    def backfill(self):
+        """Queue a board for EVERY member we hold presence data for.
+        Fixes the gap where a member who was already online when the run
+        started (snapshot lands inside the startup quiet window) never
+        gets a board until their next transition. Message ids persist,
+        so after the first run this only refreshes/edits existing boards
+        (nice side effect: live 'online (Xm)' counters refresh each run).
+        Edits stay rate-capped by the flush loop - no flood risk."""
+        n = 0
+        for (uid,) in db.execute(
+                "SELECT DISTINCT user_id FROM presence_events"):
+            if uid == SELF_ID:
+                continue
+            if self.enabled():
+                self.dirty.add(uid)
+                n += 1
+        return n
+
     async def restore(self):
         try:
             for key, val in db.execute(
@@ -1105,6 +1123,18 @@ async def main():
     client.loop.create_task(boards.run())
     await snapshot(entity)
     client.loop.create_task(presence_alerts())
+
+    async def backfill_boards():
+        # give the startup burst time to settle, then make sure EVERY
+        # member with data has a board (edit for existing ones - no spam)
+        await asyncio.sleep(QUIET_SECONDS + 30)
+        try:
+            if boards is not None:
+                n = boards.backfill()
+                log.info("board backfill: queued %d members' boards", n)
+        except Exception:
+            log.exception("board backfill failed")
+    client.loop.create_task(backfill_boards())
 
     if SNAPSHOT_EVERY > 0:
         async def resnap():
