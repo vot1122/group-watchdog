@@ -227,6 +227,14 @@ def load_names():
         NAMES[uid] = ("@" + username) if username else (display_name or str(uid))
 
 
+MEMBER_IDS = set()   # roster of the watched group (mirrors the users table)
+
+
+def load_member_ids():
+    MEMBER_IDS.clear()
+    MEMBER_IDS.update(r[0] for r in db.execute("SELECT user_id FROM users"))
+
+
 def remember_name(u):
     name = " ".join(p for p in (getattr(u, "first_name", None),
                                 getattr(u, "last_name", None)) if p)
@@ -282,6 +290,7 @@ def cleanup_bad_rows():
 def upsert_user(u, detect_changes=True):
     if getattr(u, "bot", False) or getattr(u, "deleted", False):
         return
+    MEMBER_IDS.add(u.id)     # everyone upserted here is a group member
     name = " ".join(p for p in (getattr(u, "first_name", None),
                                 getattr(u, "last_name", None)) if p)
     old = db.execute(
@@ -355,6 +364,11 @@ def short_dur(sec):
 
 def record_status(user_id, status, source):
     if user_id == SELF_ID:
+        return
+    # ONLY track members of the watched group. Telegram pushes status
+    # updates for everyone the account has dialogs with (DM contacts!) -
+    # those are not suspects and must not be logged or shown.
+    if MEMBER_IDS and user_id not in MEMBER_IDS:
         return
     fresh = time.time() - START_TS > QUIET_SECONDS
     if isinstance(status, UserStatusOnline):
@@ -976,6 +990,45 @@ def bind_command_handlers(log_entity):
                 "/report - full spam-signal report as a file")
 
 
+async def purge_non_members():
+    """Remove presence data (and their board messages in the log group) for
+    anyone who is NOT a member of the watched group - e.g. DM contacts the
+    account has dialogs with. Runs once after the startup snapshot, when the
+    roster is guaranteed to be loaded."""
+    load_member_ids()
+    stray = [r[0] for r in db.execute(
+        "SELECT DISTINCT user_id FROM presence_events "
+        "WHERE user_id NOT IN (SELECT user_id FROM users)")]
+    if not stray:
+        return
+    n_ev = 0
+    mids = []
+    for uid in stray:
+        cur = db.execute("DELETE FROM presence_events WHERE user_id=?", (uid,))
+        n_ev += cur.rowcount
+        row = db.execute(
+            "SELECT value FROM settings WHERE key=?", ("uboard:%d" % uid,)).fetchone()
+        if row:
+            try:
+                mids.append(int(row[0]))
+            except (TypeError, ValueError):
+                pass
+            db.execute("DELETE FROM settings WHERE key=?", ("uboard:%d" % uid,))
+        LAST_STATE.pop(uid, None)
+    db.commit()
+    if mids and boards is not None and boards.log_entity is not None:
+        try:
+            await client.delete_messages(boards.log_entity, mids)
+        except Exception:
+            log.exception("could not delete stale board messages")
+    if boards is not None:
+        for uid in stray:
+            boards.msg_ids.pop(uid, None)
+            boards.last_text.pop(uid, None)
+            boards.dirty.pop(uid, None)
+    log.info("purged %d non-member user(s), %d events", len(stray), n_ev)
+
+
 async def snapshot(entity):
     n = 0
     async for u in client.iter_participants(entity):
@@ -1210,10 +1263,12 @@ async def main():
              "ON" if NTFY_TOPIC else "OFF", NTFY_LEVEL if NTFY_TOPIC else "-")
 
     load_names()
+    load_member_ids()
     bind_group_handlers(entity)
     notifier.start()
     client.loop.create_task(boards.run())
     await snapshot(entity)
+    await purge_non_members()
     client.loop.create_task(presence_alerts())
 
     async def backfill_boards():
