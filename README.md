@@ -208,14 +208,15 @@ private log group, from the same account** — the bot obeys instantly:
 | `/level everything` (or `notable` / `alerts`) | change what gets forwarded to the log group; saved in the database, so it survives 6-hour handovers |
 | `/tz Asia/Kolkata,UTC` | set which timezones every timestamp is shown in (multiple at once, e.g. `12:49 IST · 06:49 UTC`); any IANA names work; saved in the database |
 | `/status` | current level, when this run started, how much data is logged |
-| `/report` | generates the full spam-signal report and sends it into the chat as a `watchdog-report.md` file |
+| `/report` | generates the full spam-signal report (one clean per-member table, last-7-days actives only) and sends it into the chat as a `watchdog-report.md` file |
 | `/help` | command list |
 
 Levels: `alerts` = alert messages only; `notable` = alerts + messages,
 edits, deletions, joins/leaves, name changes; `everything` = all of that
 plus a per-member online/offline **board message** (see below).
 
-**Anti-spam output design**: every member gets their **own board message**
+**Anti-spam output design**: every member **active in the last 7 days**
+(they came online at least once) gets their **own board message**
 that is edited in place each time they come online / go offline — showing
 their recent sessions and a running total uptime that always sits at the
 bottom. While a member is **online**, the head line also ticks live:
@@ -234,7 +235,10 @@ uptime 2h01m - 3 sessions - since 21 Sep
 
 Boards are fully regenerated from the database on every change, so they
 survive restarts and 6-hour handovers, and Telegram's ~48h edit limit is
-handled automatically by rolling over into a fresh message. Edits are
+handled automatically by rolling over into a fresh message. Members who
+never came online (or went quiet for over 7 days) get **no board at all**, and
+their stale boards are deleted automatically at startup - the log group
+stays lean. Edits are
 coalesced and rate-capped to stay far below flood limits. On top of that
 there is ONE rolling log message for notable events (new one only after
 100 lines) and a LIVE REPORT dashboard re-edited every 10 minutes with the

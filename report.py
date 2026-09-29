@@ -223,6 +223,13 @@ def churn_stats(db):
 
 
 # ----------------------------------------------------------------- output ---
+
+# a member counts as "active" (tracked in report/boards) if they came
+# online in the last ACTIVE_DAYS days; older ones are excluded until
+# they return (survives restarts - computed from the data each time)
+ACTIVE_DAYS = int(os.environ.get("ACTIVE_DAYS", "7"))
+
+
 def _monitor_cutoff(db):
     """Events dated before the monitor started are Telegram-backfilled
     last-seen timestamps (sometimes months old), not observations -
@@ -236,7 +243,9 @@ def _monitor_cutoff(db):
 
 
 def _observed_events(db):
-    """All presence events, trimmed to the actual monitoring window."""
+    """All presence events, trimmed to the actual monitoring window and
+    restricted to members who came online in the last ACTIVE_DAYS days -
+    members not online since last week are excluded from everything."""
     events = {}
     for uid, ts, online in db.execute(
             "SELECT user_id, ts, online FROM presence_events ORDER BY ts"):
@@ -246,7 +255,10 @@ def _observed_events(db):
         events = {uid: [r for r in rows if r[0] >= cutoff]
                   for uid, rows in events.items()}
         events = {uid: rows for uid, rows in events.items() if rows}
-    return events
+    acut = time.time() - ACTIVE_DAYS * 86400
+    active = {uid for uid, rows in events.items()
+              if any(on and ts >= acut for ts, on in rows)}
+    return {uid: rows for uid, rows in events.items() if uid in active}
 
 
 def co_presence(events, min_trans=12, tol=20, ratio=0.8):
@@ -294,9 +306,7 @@ def build_report(db):
     events = _observed_events(db)
 
     msg = message_stats(db)
-    churn, joins_leaves = churn_stats(db)
-    known_bots = {uid for uid, u in users.items() if u["is_bot"]}
-    no_data = [uid for uid in users if uid not in events]
+    churn, _ = churn_stats(db)
 
     def uname(uid):
         u = users.get(uid, {})
@@ -327,38 +337,50 @@ def build_report(db):
     lines = []
     a = lines.append
 
+    now = time.time()
+    first = _monitor_cutoff(db)
     a("# Group watchdog report")
     a("")
-    a("Generated %s" % fmt_ts(time.time()))
+    a("Generated %s" % fmt_ts(now))
+    if first:
+        d = now - first
+        a("")
+        a("watching since %s (%dd%02dh) \u00b7 %d of %d members online in "
+          "the last %d days" % (
+              fmt_ts(first), d // 86400, (d % 86400) // 3600,
+              len(results), len(users), ACTIVE_DAYS))
+    else:
+        a("")
+        a("%d of %d members online in the last %d days"
+          % (len(results), len(users), ACTIVE_DAYS))
     a("")
 
-    # ============================ SECTION A ================================
-    a("## A. Spam / automation signals")
+    # --------------------------- the one table ----------------------------
+    a("## Member activity - last %d days (most uptime first)" % ACTIVE_DAYS)
     a("")
-
-    a("### Presence + behaviour scores (most uptime first)")
-    a("")
-    a("| user | score | verdict | observed | sessions | uptime | avg session | "
-      "longest offline | active hrs/24 | msgs | deleted |")
-    a("|---|---|---|---|---|---|---|---|---|---|---|")
+    a("| user | last seen | uptime | sessions | avg session | "
+      "longest offline | msgs | deleted | score | signals |")
+    a("|---|---|---|---|---|---|---|---|---|---|")
     for m in results:
-        ratio = (("%.0f%%" % (100 * m["uptime_ratio"]))
-                 if m["uptime_ratio"] is not None else "n/a")
-        uptime = "%s (%s)" % (human(m["uptime"]), ratio)
         ms = m["msg"] or {}
-        a("| %s | %d | %s | %.1fh | %d | %s | %s | %s | %d | %s | %s |" % (
-            uname(m["user_id"]), m["score"], label(m["score"]), m["window_h"],
-            m["n_sessions"], uptime, human(m["avg_session"]),
-            human(m["longest_gap"]), m["active_h"],
-            ms.get("sent", "-"), ms.get("deleted", "-")))
+        ratio = (("%.0f%%" % (100 * m["uptime_ratio"]))
+                 if m["uptime_ratio"] is not None else "-")
+        sig = "; ".join(m["reasons"][:2]) if m["reasons"] else "-"
+        a("| %s | %s | %s (%s) | %d | %s | %s | %s | %s | %d | %s |" % (
+            uname(m["user_id"]), fmt_ts(m["last"]),
+            human(m["uptime"]), ratio, m["n_sessions"],
+            human(m["avg_session"]), human(m["longest_gap"]),
+            ms.get("sent", "-"), ms.get("deleted", "-"),
+            m["score"], sig))
     a("")
 
+    # ----------------------- coordinated accounts -------------------------
     if pairs:
-        a("### Coordinated accounts (presence moves together)")
+        a("## Coordinated accounts (presence moves together)")
         a("")
         a("These accounts go online/offline within seconds of each other on"
-          " most of their transitions - a strong sign of one operator or")
-        a("clone tooling. Verify manually before acting.")
+          " most of their transitions - a strong sign of one operator or"
+          " clone tooling. Verify manually before acting.")
         a("")
         seen_pairs = set()
         for uid, (other, ra, rb) in pairs.items():
@@ -370,140 +392,35 @@ def build_report(db):
               % (uname(uid), uname(other), round(100 * ra), round(100 * rb)))
         a("")
 
-    heavy_deleters = [(m["msg"]["deleted"], m["msg"]["sent"], m)
-                      for m in results if m["msg"] and m["msg"]["deleted"] >= 3]
-    if heavy_deleters:
-        a("### Deletion-heavy accounts (post-then-delete is a spam pattern)")
-        a("")
-        for deleted, sent, m in sorted(heavy_deleters, reverse=True):
-            a("- %s deleted **%d of %d** messages they sent" % (
-                uname(m["user_id"]), deleted, sent))
-        a("")
-
-    churners = [(m["churn"], m) for m in results if m["churn"] >= 2]
-    if churners:
-        a("### Join/leave churn")
-        a("")
-        for c, m in sorted(churners, reverse=True):
-            a("- %s joined/left the group %d times" % (uname(m["user_id"]), c))
-        a("")
-
-    if known_bots:
-        a("### Registered Telegram bots detected")
-        a("")
-        for uid in known_bots:
-            u = users[uid]
-            a("- %s%s" % (u["username"] or uid,
-                          (" (%s)" % u["display_name"]) if u["display_name"] else ""))
-        a("")
-
-    a("### Per-user signal details")
-    a("")
-    for m in results:
-        u = users.get(m["user_id"], {})
-        name = u.get("username") or m["user_id"]
-        a("#### %s%s" % (name, (" (%s)" % u["display_name"]) if u.get("display_name") else ""))
-        a("")
-        a("- verdict: **%s** (score %d/100)" % (label(m["score"]), m["score"]))
-        for r in m["reasons"]:
-            a("- %s" % r)
-        a("")
-
-    # ============================ SECTION B ================================
-    a("## B. Not directly spam-related, but logged (might come in handy)")
-    a("")
-
-    total_msgs = db.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
-    total_deleted = db.execute(
-        "SELECT COUNT(*) FROM messages WHERE deleted=1").fetchone()[0]
-    total_edits = db.execute(
-        "SELECT COALESCE(SUM(edit_count),0) FROM messages").fetchone()[0]
-    total_presence = db.execute(
-        "SELECT COUNT(*) FROM presence_events").fetchone()[0]
-    ge_counts = dict(db.execute(
-        "SELECT kind, COUNT(*) FROM group_events GROUP BY kind").fetchall())
-    a("### Everything recorded so far")
-    a("")
-    a("- presence events logged: %d" % total_presence)
-    a("- messages logged: %d (%d later edited, %d later deleted)"
-      % (total_msgs, total_edits, total_deleted))
-    a("- group events: %s" % (
-        ", ".join("%d %s" % (v, k) for k, v in sorted(ge_counts.items()))
-        or "none"))
-    a("")
-
-    talkers = sorted((m["msg"]["sent"], m) for m in results if m["msg"])
-    if talkers:
-        a("### Top talkers (messages sent while monitored)")
-        a("")
-        for sent, m in sorted(talkers, key=lambda x: -x[0])[:10]:
-            a("- %s: %d messages (%d edited, %d deleted)" % (
-                uname(m["user_id"]), sent,
-                m["msg"]["edits"], m["msg"]["deleted"]))
-        a("")
-
-    changes = list(db.execute(
-        "SELECT ts, user_id, kind, data FROM group_events "
-        "WHERE kind IN ('username_change','name_change') ORDER BY ts DESC LIMIT 50"))
-    if changes:
-        a("### Username / name changes (most recent first)")
-        a("")
-        for ts, uid, kind, data in changes:
-            a("- %s - %s %s: %s" % (fmt_ts(ts), uname(uid),
-                                     "username" if kind == "username_change" else "name",
-                                     data))
-        a("")
-
+    # ----------------------- recent group activity ------------------------
     jlt = list(db.execute(
         "SELECT ts, user_id, kind, data FROM group_events "
-        "WHERE kind IN ('join','leave','kicked') ORDER BY ts DESC LIMIT 30"))
-    if jlt:
-        a("### Recent joins / leaves / kicks")
+        "WHERE kind IN ('join','leave','kicked') ORDER BY ts DESC LIMIT 10"))
+    changes = list(db.execute(
+        "SELECT ts, user_id, kind, data FROM group_events "
+        "WHERE kind IN ('username_change','name_change') "
+        "ORDER BY ts DESC LIMIT 10"))
+    if jlt or changes:
+        a("## Recent group activity (newest first, last 10)")
         a("")
         for ts, uid, kind, data in jlt:
             a("- %s - %s %s" % (fmt_ts(ts), uname(uid), data))
+        for ts, uid, kind, data in changes:
+            a("- %s - %s changed %s to %s" % (
+                fmt_ts(ts), uname(uid),
+                "username" if kind == "username_change" else "name", data))
         a("")
 
-    if no_data:
-        a("### Members with no presence data")
-        a("")
-        a("(Last seen hidden by privacy settings - cannot be tracked by anyone, "
-          "or never seen online while monitoring.)")
-        a("")
-        for uid in no_data:
-            u = users[uid]
-            a("- %s%s" % (u["username"] or uid,
-                          (" (%s)" % u["display_name"]) if u["display_name"] else ""))
-        a("")
-
-    # ============================ details =================================
-    a("## Full presence details per user")
+    # --------------------------- how to read this -------------------------
+    a("## How to read this")
     a("")
-    for m in results:
-        u = users.get(m["user_id"], {})
-        name = u.get("username") or m["user_id"]
-        a("### %s%s" % (name, (" (%s)" % u["display_name"]) if u.get("display_name") else ""))
-        a("")
-        a("- observed: %s -> %s (%.1f hours)" % (
-            fmt_ts(m["first"]), fmt_ts(m["last"]), m["window_h"]))
-        if m.get("first_online"):
-            a("- note: was already online when monitoring began - uptime is "
-              "counted from when we first saw them")
-        a("- total uptime: %s across %d sessions" % (human(m["uptime"]), m["n_sessions"]))
-        a("- total offline time (observed): %s" % human(m["offline"]))
-        if m["uptime_ratio"] is not None:
-            a("- uptime ratio: %.1f%%" % (100 * m["uptime_ratio"]))
-        a("- longest session: %s, average session: %s" % (
-            human(m["max_session"]), human(m["avg_session"])))
-        a("- longest offline gap: %s" % human(m["longest_gap"]))
-        a("")
-
-    a("### Notes")
-    a("")
-    a("- Members who hide their 'last seen' privacy cannot be tracked by anyone, "
-      "including this tool.")
-    a("- Scores are heuristics, not proof. Always combine with manual review "
-      "(message content, account age, join date) before acting.")
+    a("- score: 0-39 looks human, 40-69 suspicious, 70+ likely automation."
+      " Heuristics, not proof - always review manually before acting.")
+    a("- uptime = total time online while monitored (share of the observed"
+      " window in brackets); signals lists the main scoring reasons.")
+    a("- only members who came online in the last %d days are listed here."
+      " Members who hide their 'last seen' cannot be tracked by anyone."
+      % ACTIVE_DAYS)
     return "\n".join(lines), results
 
 

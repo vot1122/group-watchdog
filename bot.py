@@ -84,6 +84,11 @@ LOG_MESSAGE_TEXT = os.environ.get("LOG_MESSAGE_TEXT", "1") == "1"
 # accepts being visible in exchange). Set PRIVACY_AUTO=0 to opt out.
 PRIVACY_AUTO = os.environ.get("PRIVACY_AUTO", "1") == "1"
 
+# a member counts as "active" (gets a board / appears in the report) only
+# if they came online in the last ACTIVE_DAYS days - members who never
+# came online get NO board message at all
+ACTIVE_DAYS = int(os.environ.get("ACTIVE_DAYS", "7"))
+
 # per-user board messages (online/offline history, one edited msg per member)
 BOARD_EVERY = int(os.environ.get("BOARD_EVERY", "5"))       # flush cycle, seconds
 BOARD_HISTORY = int(os.environ.get("BOARD_HISTORY", "12"))    # sessions kept per board
@@ -612,16 +617,16 @@ class UserBoards:
             self.dirty[uid] = None
 
     def backfill(self):
-        """Queue a board for EVERY member we hold presence data for.
-        Fixes the gap where a member who was already online when the run
-        started (snapshot lands inside the startup quiet window) never
-        gets a board until their next transition. Message ids persist,
-        so after the first run this only refreshes/edits existing boards
-        (nice side effect: live 'online (Xm)' counters refresh each run).
-        Edits stay rate-capped by the flush loop - no flood risk."""
+        """Queue a board for every member who came online recently. Members
+        who never came online (or went quiet for more than ACTIVE_DAYS
+        days) get NO board at all - the log group stays lean. Message ids
+        persist, so after the first run this only refreshes/edits existing
+        boards. Edits stay rate-capped by the flush loop - no flood risk."""
         n = 0
+        cutoff = time.time() - ACTIVE_DAYS * 86400
         for (uid,) in db.execute(
-                "SELECT DISTINCT user_id FROM presence_events"):
+                "SELECT DISTINCT user_id FROM presence_events "
+                "WHERE online=1 AND ts >= ?", (cutoff,)):
             if uid == SELF_ID:
                 continue
             if self.enabled():
@@ -1029,6 +1034,43 @@ async def purge_non_members():
     log.info("purged %d non-member user(s), %d events", len(stray), n_ev)
 
 
+async def cleanup_stale_boards():
+    """Delete board messages of members who have NOT come online in the
+    last ACTIVE_DAYS days (or never did) - removes the clutter of boards
+    for members who were never online. Runs once at startup, after the
+    roster is loaded."""
+    cutoff = time.time() - ACTIVE_DAYS * 86400
+    active = {r[0] for r in db.execute(
+        "SELECT DISTINCT user_id FROM presence_events "
+        "WHERE online=1 AND ts >= ?", (cutoff,))}
+    stale = []
+    for key, val in db.execute(
+            "SELECT key, value FROM settings WHERE key LIKE 'uboard:%'"):
+        try:
+            uid = int(key.split(":", 1)[1])
+            mid = int(val)
+        except (TypeError, ValueError):
+            continue
+        if uid != SELF_ID and uid not in active:
+            stale.append((uid, mid))
+    if not stale:
+        return
+    if boards is not None and boards.log_entity is not None:
+        try:
+            await client.delete_messages(boards.log_entity,
+                                         [mid for _, mid in stale])
+        except Exception:
+            log.exception("could not delete stale board messages")
+    for uid, mid in stale:
+        db.execute("DELETE FROM settings WHERE key=?", ("uboard:%d" % uid,))
+        if boards is not None:
+            boards.msg_ids.pop(uid, None)
+            boards.last_text.pop(uid, None)
+            boards.dirty.pop(uid, None)
+    db.commit()
+    log.info("cleaned up %d stale board message(s)", len(stale))
+
+
 async def snapshot(entity):
     n = 0
     async for u in client.iter_participants(entity):
@@ -1269,6 +1311,7 @@ async def main():
     client.loop.create_task(boards.run())
     await snapshot(entity)
     await purge_non_members()
+    await cleanup_stale_boards()
     client.loop.create_task(presence_alerts())
 
     async def backfill_boards():
