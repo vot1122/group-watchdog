@@ -319,7 +319,10 @@ def build_report(db):
             m["score"] = min(100, m["score"] + 35)
             m["reasons"].append("moves in sync with %s (%d%% of transitions)"
                                 % (uname(p[0]), round(100 * p[1])))
-    results.sort(key=lambda x: -x["score"])
+    # most uptime first (score as tie-breaker): the moderator wants to
+    # eyeball the biggest uptime holders at the top; scores still mark
+    # suspicious rows
+    results.sort(key=lambda x: (-(x["uptime"] or 0), -x["score"]))
 
     lines = []
     a = lines.append
@@ -333,13 +336,15 @@ def build_report(db):
     a("## A. Spam / automation signals")
     a("")
 
-    a("### Presence + behaviour scores (most suspicious first)")
+    a("### Presence + behaviour scores (most uptime first)")
     a("")
     a("| user | score | verdict | observed | sessions | uptime | avg session | "
       "longest offline | active hrs/24 | msgs | deleted |")
     a("|---|---|---|---|---|---|---|---|---|---|---|")
     for m in results:
-        uptime = ("%.0f%%" % (100 * m["uptime_ratio"])) if m["uptime_ratio"] is not None else "n/a"
+        ratio = (("%.0f%%" % (100 * m["uptime_ratio"]))
+                 if m["uptime_ratio"] is not None else "n/a")
+        uptime = "%s (%s)" % (human(m["uptime"]), ratio)
         ms = m["msg"] or {}
         a("| %s | %d | %s | %.1fh | %d | %s | %s | %s | %d | %s | %s |" % (
             uname(m["user_id"]), m["score"], label(m["score"]), m["window_h"],
@@ -525,7 +530,8 @@ def compact_report(db, limit=6):
         s, reasons = score(m, m["msg"], m["churn"])
         m["score"], m["reasons"] = s, reasons
         results.append(m)
-    results.sort(key=lambda x: -x["score"])
+    # most uptime first, score as tie-breaker - matches the full report
+    results.sort(key=lambda x: (-(x["uptime"] or 0), -x["score"]))
 
     def uname(uid):
         u = users.get(uid, {})
@@ -553,17 +559,19 @@ def compact_report(db, limit=6):
     lines = ["\U0001F4CA LIVE REPORT · %s%s" % (
         fmt_tz(now.timestamp(), _tz_list(db), with_date=True), watching)]
 
-    shown = [m for m in results if m["score"] > 0][:limit]
+    shown = results[:limit]      # already sorted: most uptime first
     if shown:
-        lines.append("─ suspects ─")
+        lines.append("─ top uptime ─")
         for m in shown:
             mark = ("\U0001F534" if m["score"] >= 70
                     else "\U0001F7E1" if m["score"] >= 40 else "\u25CB")
-            lines.append("%s %d %s · %s" % (
-                mark, m["score"], uname(m["user_id"]),
-                "; ".join(m["reasons"][:2])[:70]))
+            line = "%s %s %s · %d" % (
+                mark, uname(m["user_id"]), human(m["uptime"]), m["score"])
+            if m["score"] > 0 and m["reasons"]:
+                line += " · " + m["reasons"][0][:50]
+            lines.append(line)
     else:
-        lines.append("no suspects yet · needs ~a day of data")
+        lines.append("no presence data yet")
 
     try:
         n_msgs = db.execute("SELECT COUNT(*) FROM messages").fetchone()[0]

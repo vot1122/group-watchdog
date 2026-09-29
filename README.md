@@ -238,7 +238,8 @@ handled automatically by rolling over into a fresh message. Edits are
 coalesced and rate-capped to stay far below flood limits. On top of that
 there is ONE rolling log message for notable events (new one only after
 100 lines) and a LIVE REPORT dashboard re-edited every 10 minutes with the
-current top suspects and stats. Alerts (floods, mass deletions,
+top-uptime members first (with their scores and reasons), plus stats.
+Alerts (floods, mass deletions,
 always-online) still arrive as their own messages since they are rare.
 
 Performance hardening: SQLite runs in WAL mode, duplicate/stale presence
